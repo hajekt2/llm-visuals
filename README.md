@@ -3,7 +3,7 @@
 **A live terminal dashboard for the LLM running on your machine.**
 
 It finds the inference servers you already have up (llama.cpp `llama-server`,
-ollama, vLLM, SGLang, …), reads their counters and NVIDIA, AMD or Intel
+ollama, vLLM, SGLang, Strata, …), reads their counters and NVIDIA, AMD or Intel
 GPU telemetry, and turns them into a truecolor picture of what the model is doing
 right now: tokens per second, time to first token, GPU load and memory, context fill, speculative-decoding
 acceptance, which layers are busy on which GPU, and, with a small server patch,
@@ -42,8 +42,7 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 
 Requirements: a Rust toolchain (1.75+), `nvidia-smi` for NVIDIA GPU panels,
 `xpu-smi` for Intel GPU panels or the Linux amdgpu driver for AMD GPU panels,
-and a locally listening
-`llama-server` for throughput panels. Nothing at all is needed for demo mode.
+and a reachable inference server for throughput panels. Nothing at all is needed for demo mode.
 
 On Windows 11, see [Windows](#windows) for setup; on a Mac, see
 [macOS](#macos). Prebuilt binaries for all three, on x86-64 and ARM64, are
@@ -448,8 +447,9 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | VRAM busy % | NVIDIA `utilization.memory` or AMD `mem_busy_percent` (memory-controller busy time) |
 | bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps, summed over every shard of a split file), expert tensors × used/total, embedding and engram tables excluded, split CPU vs GPU by what the cards hold, × steps/s |
 
-Per-request `timings` only appear inside completion responses, which the
-dashboard never sees, so everything is reconstructed from polled counters.
+For llama.cpp, per-request `timings` only appear inside completion responses,
+which the dashboard never sees, so they are reconstructed from polled counters.
+Strata instead exposes recent request summaries in `/metrics`; see below.
 
 ---
 
@@ -519,12 +519,73 @@ MTP.
 
 ---
 
+### Strata
+
+[Strata](https://github.com/Niko1221/Strata) exposes its Monitor tab as JSON
+at `GET /metrics`. No server patch, metrics flag, local GPU driver, or model
+file is required. For a server on another machine:
+
+```sh
+cargo install --path . --locked
+llm-visuals --endpoint http://inference-host:8080 --backend strata
+```
+
+`--endpoint` alone also auto-detects Strata from the JSON metrics shape.
+`--model http://inference-host:8080/v1` works too. Local
+`python serve/server.py --engine strata` launchers are detected by process
+scan, including their `--host` and `--port`. A remote server must be selected
+by URL; the dashboard does not scan your network.
+
+The Strata view shows server-windowed decode and engine-measured mean prefill
+rates (with local display smoothing and history), model/context fill, prompt
+progress, state/phase and queued requests. Its hardware panel uses the
+**server's** GPU, PCIe, CPU, RAM and disk readings, never the monitoring
+machine's telemetry. It also shows KV mode/residency, expert-cache capacity
+and slots, free VRAM, speculative/MTP/lookup settings, conversation-cache
+capacity, prefix reuse and expert-cache hits from recent requests. Wider
+terminals include engine allocation settings and request RAM/file blob counts.
+Recent requests come directly from Strata, newest first, with measured prompt
+and decode rates/times and finish reasons.
+
+**Unavailable is not zero.** The verified `/metrics` contract does not expose
+TTFT, draft offered/accepted counters, current prefix reuse, or the number of
+parked conversations. These are explicitly marked unavailable; `prompt_ms`
+is shown as **prompt time**, not TTFT, and configured conversation-cache slots
+are **capacity**, not occupancy. Expert `hit_rate` is not speculative
+acceptance or prompt-cache hit rate. No layer placement, expert identities,
+weight/KV memory split or bandwidth bottleneck is invented. While Strata has
+focus, the zoom/view keys retain these Strata panels rather than showing
+unsupported layer/expert simulations.
+
+| Strata display | JSON fields from `/metrics` |
+|---|---|
+| Model, window, context fill | `engine.model`, `engine.max_context` (`context` fallback); live `prompt_tokens + generated`, else last request `prompt_tokens + output_tokens` when idle |
+| Decode, prefill | `live.tok_s` (Strata's sliding window), `live.prefill_tok_s_mean`; `tok_s_mean` is also shown on tall terminals |
+| Phase, queue, progress | `live.state`, `phase`, `queued`, `elapsed_s`, `prompt_read`, `prompt_total`, `max_tokens` |
+| KV, experts, VRAM | `engine.kv`, `kv_resident`, `expert_cache_mib`, `expert_slots`, `expert_cache_primary_mib`, `expert_slots_primary`, `vram_free_mib` |
+| Spec/cache settings | `engine.spec`, `mtp_max`, `lookup`, `conversation_cache_mib`, `conversation_cache_slots`, `conversation_cache_min_free_mib`; allocation/settings line uses `arena_mib`, `pool_workers`, `pcie_frac`, `spec_min_p`, `cvec`, `version`, `images` |
+| Hardware | `hardware.gpu_*`, `cpu`, `ram_used`, `ram_total`, `disk_read_mb`, `disk_write_mb`; names/counts from `hardware_static`. Byte sizes are converted to GiB; PCIe/disk rates are MiB/s. Multi-GPU telemetry follows Strata's aggregation |
+| Request history | `requests[].finish`, `prompt_tokens`, `reused`, `output_tokens`, `prompt_ms`, `decode_tok_s`, `duration_s`, `hit_rate`, `file_mb`, `ram_blobs`, `file_blobs`; prefill = `(prompt_tokens − reused) / (prompt_ms / 1000)` |
+| Server totals, tok/J | `totals.requests`, `prompt_tokens`, `reused`, `output_tokens`; tok/J = server decode rate / `hardware.gpu_power` |
+
+Missing/null/renamed fields read as `—`. A failed scrape clears the remote
+panels, retries automatically, and backs off to at least two seconds after
+three failures. SQLite model samples include Strata rates/context/server totals;
+Strata's historical requests are displayed but not imported into the SQLite
+request table, so polling does not fabricate TTFT or duplicate old requests.
+The SQLite GPU table continues to describe the dashboard host, not the remote
+server. Use `--log-db off` for a console-only session.
+
+Live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
+Parser fixtures and provenance are described in [fixtures/README.md](fixtures/README.md).
+
 ## Command-line options
 
 ```
 --demo               synthetic servers and GPUs; exercises every panel
 --demo-models N      how many synthetic servers --demo runs (default 2)
 --endpoint <url>     inference server endpoint URL (e.g. http://localhost:7000/v1)
+--backend auto|strata explicit endpoint backend (default: auto)
 --model <id|url|auto>`auto` (default) observes running servers or local endpoints;
                      an HTTP URL attaches to that inference endpoint;
                      an HF id streams real attention via the Python bridge
@@ -737,6 +798,7 @@ src/
 ├── host.rs          /proc disk, faults, RSS; in-process NVML PCIe (dmon fallback)
 ├── fade.rs          smoothing and expert heat
 ├── observe.rs       /slots, /metrics, /experts parsers
+├── strata.rs        Strata JSON /metrics adapter, remote hardware and settings
 ├── gpu.rs           NVIDIA/AMD/Intel collectors, demo GPUs
 ├── nvml.rs          in-process NVML driver bindings & PCIe throughput
 ├── model_detect.rs  finds the servers, parses their command lines

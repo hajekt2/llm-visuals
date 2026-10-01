@@ -45,6 +45,15 @@ impl std::fmt::Display for DetectedModel {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        if self.engine == "strata" {
+            return write!(
+                f,
+                "{} ({}:{} · strata)",
+                self.name,
+                self.host,
+                self.port.unwrap_or(8080)
+            );
+        }
         if self.pid == 0 {
             if let Some(port) = self.port {
                 write!(
@@ -167,7 +176,8 @@ impl DetectedModel {
     /// Keep routers until public-port configuration and child deduplication.
     /// Otherwise restricted /proc would hide the only 8080 mapping target.
     fn is_idle_daemon(&self) -> bool {
-        self.mem_used_mb == 0
+        self.engine != "strata"
+            && self.mem_used_mb == 0
             && self.path.is_none()
             && self.gguf.is_none()
             && !self.is_llama_router()
@@ -753,7 +763,7 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
     models.sort_by_key(|m| {
         let has_model = m.path.is_some() || m.gguf.is_some();
         let engine_rank = match m.engine.as_str() {
-            "llama.cpp" | "vllm" | "sglang" | "exllamav2" => 2,
+            "llama.cpp" | "vllm" | "sglang" | "strata" | "exllamav2" => 2,
             "ollama" => 0,
             _ => 1,
         };
@@ -816,6 +826,13 @@ struct ParsedCmd {
     tensor_split: Vec<f32>,
 }
 
+fn is_strata_server(cmdline: &str) -> bool {
+    crate::sglang::cmdline_flag(cmdline, "--engine").as_deref() == Some("strata")
+        && cmdline
+            .split_whitespace()
+            .any(|t| t == "serve.server" || t.replace('\\', "/").ends_with("serve/server.py"))
+}
+
 fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
     let p = process_name.to_lowercase();
     let c = cmdline.to_lowercase();
@@ -855,7 +872,8 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
             || t.contains("sglang.launch_server")
             || t.contains("sglang.srt.entrypoints")
     };
-    keys.iter().any(|k| p.contains(k))
+    is_strata_server(cmdline)
+        || keys.iter().any(|k| p.contains(k))
         || c.split_whitespace().any(token_matches)
         || names_a_model(cmdline)
 }
@@ -932,7 +950,9 @@ fn names_a_model(cmdline: &str) -> bool {
 
 fn engine_from(process_name: &str, cmdline: &str) -> String {
     let blob = format!("{process_name} {cmdline}").to_lowercase();
-    if blob.contains("llama-server") || blob.contains("llama.cpp") {
+    if is_strata_server(cmdline) {
+        "strata".into()
+    } else if blob.contains("llama-server") || blob.contains("llama.cpp") {
         "llama.cpp".into()
     } else if blob.contains("ollama") {
         "ollama".into()
@@ -1139,6 +1159,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     // as no split at all; taken literally it puts every weight on the CPU.
     if parsed.tensor_split.iter().all(|&s| s == 0.0) {
         parsed.tensor_split.clear();
+    }
+    if parsed.port.is_none() && parsed.engine == "strata" {
+        parsed.port = Some(8080);
     }
     if parsed.port.is_none() && parsed.engine == "llama.cpp" {
         parsed.port = Some(8080);
@@ -1949,6 +1972,44 @@ pub fn resolve_model_path(pid: u32, path: &Path, model_name: &str) -> PathBuf {
     path.to_path_buf()
 }
 
+fn strata_model(host: &str, port: u16, m: &crate::strata::StrataMetrics) -> DetectedModel {
+    let name = crate::strata::text(&m.engine, "model")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("strata-{port}"));
+    DetectedModel {
+        name: name.clone(),
+        path: None,
+        pid: 0,
+        process_name: format!("strata (:{port})"),
+        engine: "strata".into(),
+        gpu_indices: Vec::new(),
+        mem_used_mb: 0,
+        host: host.into(),
+        port: Some(port),
+        ctx_max: m.context_max(),
+        spec_type: None,
+        n_gpu_layers: None,
+        tensor_split: Vec::new(),
+        cmdline: format!("{name} --port {port}"),
+        gguf: None,
+        tensors: None,
+        vision: None,
+    }
+}
+
+/// Explicit Strata selection only probes its read-only metrics endpoint.
+pub async fn probe_strata(
+    host: &str,
+    port: u16,
+    auth: &crate::observe::HttpAuth,
+) -> Option<DetectedModel> {
+    Some(strata_model(
+        host,
+        port,
+        &crate::strata::poll_metrics(host, port, auth).await?,
+    ))
+}
+
 /// Probe an HTTP inference server endpoint (OpenAI /v1, vLLM /metrics, llama.cpp /props, etc.).
 pub async fn probe_endpoint(
     host: &str,
@@ -2017,6 +2078,9 @@ pub async fn probe_endpoint(
     let mut vision: Option<Vision> = None;
     let mut saw_vllm_metrics = false;
     if let Ok(body) = http_get(host, port, "/metrics", auth).await {
+        if let Some(m) = crate::strata::parse_metrics(&body) {
+            return Some(strata_model(host, port, &m));
+        }
         if body.contains("vllm:") {
             saw_vllm_metrics = true;
             engine = "vllm".to_string();
@@ -2930,6 +2994,28 @@ mod tests {
         // must not leak in.
         assert!(!ips.iter().any(|i| i.contains('/')));
         assert!(!ips.iter().any(|i| i == "255.255.255.255"));
+    }
+
+    #[test]
+    fn detects_only_strata_http_launcher() {
+        let cmd = "python serve/server.py --engine strata --config strata-model.json --port 8098";
+        assert!(looks_like_llm("python", cmd));
+        let p = parse_cmdline("python", cmd);
+        assert_eq!(p.engine, "strata");
+        assert_eq!(p.port, Some(8098));
+        assert_eq!(
+            parse_cmdline("python", "python -m serve.server --engine=strata").port,
+            Some(8080)
+        );
+        assert!(is_strata_server(
+            r"python C:\Strata\serve\server.py --engine strata"
+        ));
+        assert!(!is_strata_server("python setup.py --engine strata"));
+        assert!(!looks_like_llm("strata", "strata --context 262144"));
+        assert!(!looks_like_llm("bash", "bash check-strata.sh"));
+        let snapshot =
+            crate::strata::parse_metrics(include_str!("../fixtures/strata-idle.json")).unwrap();
+        assert!(!strata_model("127.0.0.1", 8080, &snapshot).is_idle_daemon());
     }
 
     #[test]

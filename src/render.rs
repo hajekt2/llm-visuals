@@ -171,12 +171,260 @@ impl Renderer {
         if bar_h > 0 {
             self.render_models_bar(frame, rows[1], d);
         }
-        match d.view {
-            ViewMode::Models => self.render_compare(frame, rows[2], d),
-            ViewMode::Bandwidth => self.render_bandwidth(frame, rows[2], d),
-            _ => self.render_panels(frame, rows[2], d),
+        if d.detected.is_some_and(|m| m.engine == "strata") {
+            self.render_strata(frame, rows[2], d);
+        } else {
+            match d.view {
+                ViewMode::Models => self.render_compare(frame, rows[2], d),
+                ViewMode::Bandwidth => self.render_bandwidth(frame, rows[2], d),
+                _ => self.render_panels(frame, rows[2], d),
+            }
         }
         self.render_footer(frame, rows[3], d);
+    }
+
+    /// Strata has cache/settings facts, not layer placement or expert routing.
+    /// Its hardware is sampled on the server, never from the dashboard host.
+    fn render_strata(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let Some(m) = &d.live.strata else {
+            strata_panel(
+                frame,
+                area,
+                " ◆ STRATA ",
+                vec![
+                    "Metrics unavailable - waiting for /metrics (automatic retry)".into(),
+                    "No stale rates or remote hardware readings shown.".into(),
+                ],
+            );
+            return;
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if area.height >= 34 { 12 } else { 9 }),
+                Constraint::Length(if area.height >= 34 { 12 } else { 9 }),
+                Constraint::Min(3),
+            ])
+            .split(area);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(rows[0]);
+        self.render_throughput(frame, top[0], d);
+        self.render_strata_hardware(frame, top[1], m);
+        self.render_strata_engine(frame, rows[1], m);
+        self.render_strata_requests(frame, rows[2], m);
+    }
+
+    fn render_strata_hardware(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let h = &m.hardware;
+        strata_panel(
+            frame,
+            area,
+            " ◆ SERVER HARDWARE · /metrics ",
+            vec![
+                format!(
+                    "{} · {} GPU(s)",
+                    strata_text(&m.hardware_static, "gpu_name"),
+                    strata_num(&m.hardware_static, "gpu_count", 0)
+                ),
+                format!(
+                    "GPU {}% · {} °C · {} / {} W",
+                    strata_num(h, "gpu_util", 0),
+                    strata_num(h, "gpu_temp", 0),
+                    strata_num(h, "gpu_power", 1),
+                    strata_num(h, "gpu_power_limit", 0)
+                ),
+                format!(
+                    "VRAM {} / {} GiB · engine free {} MiB",
+                    strata_gib(h, "gpu_mem_used"),
+                    strata_gib(h, "gpu_mem_total"),
+                    strata_num(&m.engine, "vram_free_mib", 0)
+                ),
+                format!(
+                    "PCIe RX {} · TX {} MiB/s · gen {} x{}",
+                    strata_num(h, "gpu_pcie_rx_mb", 1),
+                    strata_num(h, "gpu_pcie_tx_mb", 1),
+                    strata_num(h, "gpu_pcie_gen", 0),
+                    strata_num(h, "gpu_pcie_width", 0)
+                ),
+                format!(
+                    "CPU {}% · RAM {} / {} GiB",
+                    strata_num(h, "cpu", 1),
+                    strata_gib(h, "ram_used"),
+                    strata_gib(h, "ram_total")
+                ),
+                format!(
+                    "Disk read {} · write {} MiB/s",
+                    strata_num(h, "disk_read_mb", 1),
+                    strata_num(h, "disk_write_mb", 1)
+                ),
+                format!(
+                    "{} · {} cores / {} threads",
+                    strata_text(&m.hardware_static, "cpu_name"),
+                    strata_num(&m.hardware_static, "cores", 0),
+                    strata_num(&m.hardware_static, "threads", 0)
+                ),
+            ],
+        );
+    }
+
+    fn render_strata_engine(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let e = &m.engine;
+        let l = &m.live;
+        let last = m.requests.first().unwrap_or(&serde_json::Value::Null);
+        let context = m
+            .context_max()
+            .filter(|n| *n > 0)
+            .zip(m.context_used())
+            .map(|(max, used)| {
+                format!(
+                    "{} / {} ({:.1}%)",
+                    fmt_int(used),
+                    fmt_int(max),
+                    (100.0 * used as f64 / max as f64).min(100.0)
+                )
+            })
+            .unwrap_or_else(|| "—".into());
+        let lines = vec![
+            format!(
+                "{} · {} · queued {} · elapsed {} s · TTFT unavailable",
+                m.state(),
+                strata_text(l, "phase"),
+                strata_num(l, "queued", 0),
+                strata_num(l, "elapsed_s", 1)
+            ),
+            format!(
+                "Context {} [{}] · prompt progress {} / {}",
+                context,
+                if m.state() == "idle" {
+                    "last request"
+                } else {
+                    "live"
+                },
+                strata_num(l, "prompt_read", 0),
+                strata_num(l, "prompt_total", 0)
+            ),
+            format!(
+                "KV {} · resident {} · expert cache {} MiB / {} slots",
+                strata_text(e, "kv"),
+                strata_num(e, "kv_resident", 0),
+                strata_num(e, "expert_cache_mib", 0),
+                strata_num(e, "expert_slots", 0)
+            ),
+            format!(
+                "Spec {} · MTP max {} · lookup {} · acceptance unavailable",
+                strata_num(e, "spec", 0),
+                strata_num(e, "mtp_max", 0),
+                strata_num(e, "lookup", 0)
+            ),
+            format!(
+                "Conversation cache capacity {} MiB / {} slots · parked count unavailable",
+                strata_num(e, "conversation_cache_mib", 0),
+                strata_num(e, "conversation_cache_slots", 0)
+            ),
+            format!(
+                "Last prompt reuse {} / {} · expert hit {}% · version {}",
+                strata_num(last, "reused", 0),
+                strata_num(last, "prompt_tokens", 0),
+                crate::strata::number(last, "hit_rate")
+                    .map(|n| format!("{:.1}", n * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                strata_text(e, "version")
+            ),
+            format!(
+                "Totals: {} prompt · {} reused · {} gen · {} requests",
+                strata_num(&m.totals, "prompt_tokens", 0),
+                strata_num(&m.totals, "reused", 0),
+                strata_num(&m.totals, "output_tokens", 0),
+                strata_num(&m.totals, "requests", 0)
+            ),
+            format!(
+                "Arena {} MiB · workers {} · PCIe frac {} · spec min p {} · cvec {}",
+                strata_num(e, "arena_mib", 0),
+                strata_num(e, "pool_workers", 0),
+                strata_text(e, "pcie_frac"),
+                strata_text(e, "spec_min_p"),
+                strata_num(e, "cvec", 0)
+            ),
+            format!(
+                "Primary expert cache {} MiB / {} slots · cache RAM floor {} MiB",
+                strata_num(e, "expert_cache_primary_mib", 0),
+                strata_num(e, "expert_slots_primary", 0),
+                strata_num(e, "conversation_cache_min_free_mib", 0)
+            ),
+            format!(
+                "Decode mean {} tok/s · max output {} · images {}",
+                strata_num(l, "tok_s_mean", 1),
+                strata_num(l, "max_tokens", 0),
+                e.get("images")
+                    .and_then(|v| v.as_bool())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into())
+            ),
+        ];
+        strata_panel(frame, area, " ◆ STRATA · CONTEXT / CACHES / ENGINE ", lines);
+    }
+
+    fn render_strata_requests(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let wide = area.width >= 120;
+        let mut heading = "finish     prompt   reused   output   pre t/s   dec t/s  prompt s  total s   hit%   file MB".to_string();
+        if wide {
+            heading.push_str("   RAM/file blobs");
+        }
+        let mut lines = vec![heading];
+        for r in &m.requests {
+            let pre = crate::strata::number(r, "prompt_tokens")
+                .zip(crate::strata::number(r, "reused"))
+                .zip(crate::strata::number(r, "prompt_ms").filter(|n| *n > 0.0))
+                .map(|((p, reused), ms)| format!("{:.1}", (p - reused).max(0.0) * 1000.0 / ms))
+                .unwrap_or_else(|| "—".into());
+            let mut row = format!(
+                "{:<8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>8} {:>6} {:>9}",
+                strata_text(r, "finish"),
+                strata_num(r, "prompt_tokens", 0),
+                strata_num(r, "reused", 0),
+                strata_num(r, "output_tokens", 0),
+                pre,
+                strata_num(r, "decode_tok_s", 1),
+                strata_scaled(r, "prompt_ms", 0.001, 2),
+                strata_num(r, "duration_s", 1),
+                strata_scaled(r, "hit_rate", 100.0, 1),
+                strata_num(r, "file_mb", 1)
+            );
+            if wide {
+                row.push_str(&format!(
+                    "   {}/{}",
+                    strata_num(r, "ram_blobs", 0),
+                    strata_num(r, "file_blobs", 0)
+                ));
+            }
+            lines.push(row);
+        }
+        if m.requests.is_empty() {
+            lines.push("No completed requests reported.".into());
+        }
+        strata_panel(
+            frame,
+            area,
+            " ◆ STRATA · RECENT REQUESTS · newest first ",
+            lines,
+        );
     }
 
     fn render_bandwidth(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
@@ -365,7 +613,14 @@ impl Renderer {
                     8,
                     vec![
                         Span::styled(m.engine.clone(), st(pal::TEXT)),
-                        Span::styled(format!(" pid {}", m.pid), st(pal::TEXT_DIM)),
+                        Span::styled(
+                            if m.engine == "strata" && m.pid == 0 {
+                                " endpoint".into()
+                            } else {
+                                format!(" pid {}", m.pid)
+                            },
+                            st(pal::TEXT_DIM),
+                        ),
                     ],
                 ));
                 if let Some(reason) = m.placement.reason() {
@@ -522,19 +777,49 @@ impl Renderer {
 
         // Big numerals for the decode rate.
         let live = p.phase == Phase::Decode;
-        let digits = big_digits(fmt_rate_short(p.decode_tps_smooth));
+        let digits = big_digits(
+            if d.live
+                .strata
+                .as_ref()
+                .is_some_and(|m| m.decode_rate().is_none())
+            {
+                "-".into()
+            } else {
+                fmt_rate_short(p.decode_tps_smooth)
+            },
+        );
         let digit_w = digits[0].chars().count();
         let unit_col = digit_w + 2;
         let stat_col = unit_col + 14;
-        let ttft = p
-            .current
-            .as_ref()
-            .and_then(|r| r.ttft())
-            .or_else(|| p.history.back().and_then(|r| r.ttft()));
+        let strata = d.live.strata.as_ref();
+        let ttft = if strata.is_some() {
+            None
+        } else {
+            p.current
+                .as_ref()
+                .and_then(|r| r.ttft())
+                .or_else(|| p.history.back().and_then(|r| r.ttft()))
+        };
+        let tok_j = if let Some(m) = strata {
+            crate::strata::number(&m.hardware, "gpu_power")
+                .filter(|w| *w > 0.0)
+                .zip(m.decode_rate())
+                .map(|(w, rate)| format!("{:.2}", rate as f64 / w))
+                .unwrap_or_else(|| "—".into())
+        } else {
+            format!("{:.2}", p.tokens_per_joule())
+        };
         let right_stats = [
             (
                 "prefill",
-                format!("{} tok/s", fmt_rate(p.prefill_tps_smooth)),
+                format!(
+                    "{} tok/s",
+                    if strata.is_some_and(|m| m.prefill_rate().is_none()) {
+                        "—".into()
+                    } else {
+                        fmt_rate(p.prefill_tps_smooth)
+                    }
+                ),
                 pal::MAGENTA,
             ),
             (
@@ -542,7 +827,7 @@ impl Renderer {
                 ttft.map(fmt_dur).unwrap_or_else(|| "—".into()),
                 pal::AMBER,
             ),
-            ("tok/J", format!("{:.2}", p.tokens_per_joule()), pal::GREEN),
+            ("tok/J", tok_j, pal::GREEN),
         ];
         let unit_texts = [
             ("tok/s", pal::TEXT),
@@ -592,29 +877,41 @@ impl Renderer {
         }
 
         // Session line.
-        lines.push(Line::from(vec![
-            Span::styled("session ", Style::default().fg(pal::c(pal::TEXT_DIM))),
-            Span::styled(
-                format!("{} req", p.session_requests),
-                Style::default().fg(pal::c(pal::TEXT)),
-            ),
-            Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
-            Span::styled(
-                format!("{} gen", fmt_int(p.session_decoded as usize)),
-                Style::default().fg(pal::c(pal::CYAN)),
-            ),
-            Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
-            Span::styled(
-                format!("{} prefill", fmt_int(p.session_prefilled as usize)),
-                Style::default().fg(pal::c(pal::MAGENTA)),
-            ),
-            Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
-            Span::styled(
-                format!("{:.0} W", p.total_power_w),
-                Style::default().fg(pal::c(pal::AMBER)),
-            ),
-        ]));
-
+        if let Some(m) = strata {
+            lines.push(Line::from(format!(
+                "server totals: {} req · {} gen",
+                strata_num(&m.totals, "requests", 0),
+                strata_num(&m.totals, "output_tokens", 0)
+            )));
+            lines.push(Line::from(format!(
+                "decode {} · prefill {} tok/s (server)",
+                m.decode_rate().map(fmt_rate).unwrap_or_else(|| "—".into()),
+                m.prefill_rate().map(fmt_rate).unwrap_or_else(|| "—".into())
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("session ", Style::default().fg(pal::c(pal::TEXT_DIM))),
+                Span::styled(
+                    format!("{} req", p.session_requests),
+                    Style::default().fg(pal::c(pal::TEXT)),
+                ),
+                Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+                Span::styled(
+                    format!("{} gen", fmt_int(p.session_decoded as usize)),
+                    Style::default().fg(pal::c(pal::CYAN)),
+                ),
+                Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+                Span::styled(
+                    format!("{} prefill", fmt_int(p.session_prefilled as usize)),
+                    Style::default().fg(pal::c(pal::MAGENTA)),
+                ),
+                Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+                Span::styled(
+                    format!("{:.0} W", p.total_power_w),
+                    Style::default().fg(pal::c(pal::AMBER)),
+                ),
+            ]));
+        }
         // Sparklines fill the rest: decode gets the lion's share.
         let remaining = h.saturating_sub(lines.len());
         if remaining >= 2 {
@@ -2683,8 +2980,19 @@ impl Renderer {
         ));
 
         let rate = p.decode_tps_smooth;
+        let rate_text = if m.detected.engine == "strata"
+            && m.live
+                .strata
+                .as_ref()
+                .and_then(|s| s.decode_rate())
+                .is_none()
+        {
+            "—".into()
+        } else {
+            fmt_rate(rate)
+        };
         spans.push(Span::styled(
-            format!("{:>6}", fmt_rate(rate)),
+            format!("{rate_text:>6}"),
             Style::default()
                 .fg(if rate > 0.0 {
                     pal::gradient_color(pal::FLOW, 0.85)
@@ -2705,7 +3013,19 @@ impl Renderer {
             spans.push(Span::raw(" "));
         }
 
-        if show_ctx {
+        if show_ctx
+            && m.detected.engine == "strata"
+            && m.live
+                .strata
+                .as_ref()
+                .and_then(|s| s.context_used().zip(s.context_max()))
+                .is_none()
+        {
+            spans.push(Span::styled(
+                "ctx — ",
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
+        } else if show_ctx {
             let ctx_max = m.live.ctx_max.max(1);
             let used = m.live.ctx_used().min(ctx_max);
             let frac = used as f32 / ctx_max as f32;
@@ -2721,9 +3041,13 @@ impl Renderer {
         }
 
         if show_vram {
-            let gb = m.detected.mem_used_mb as f32 / 1024.0;
+            let vram = if m.detected.engine == "strata" {
+                "—".to_string() // Strata does not report per-process VRAM
+            } else {
+                format!("{:.1}", m.detected.mem_used_mb as f32 / 1024.0)
+            };
             spans.push(Span::styled(
-                format!("{gb:>5.1}G "),
+                format!("{vram:>5}G "),
                 Style::default().fg(pal::c(pal::BLUE)),
             ));
         }
@@ -2769,6 +3093,34 @@ impl Renderer {
 
     fn render_model_card(&self, frame: &mut Frame, area: Rect, i: usize, d: &Dashboard) {
         let m = &d.models[i];
+        if m.detected.engine == "strata" {
+            let lines = if let Some(s) = &m.live.strata {
+                vec![
+                    m.detected.name.clone(),
+                    format!("state {}", s.state()),
+                    format!("decode {} tok/s", strata_num(&s.live, "tok_s", 1)),
+                    format!(
+                        "prefill {} tok/s",
+                        strata_num(&s.live, "prefill_tok_s_mean", 1)
+                    ),
+                    format!(
+                        "context {} / {}",
+                        s.context_used().map(fmt_int).unwrap_or_else(|| "—".into()),
+                        s.context_max().map(fmt_int).unwrap_or_else(|| "—".into())
+                    ),
+                    format!(
+                        "expert cache {} MiB",
+                        strata_num(&s.engine, "expert_cache_mib", 0)
+                    ),
+                    "TTFT / acceptance unavailable".into(),
+                    "Remote hardware: focus this model".into(),
+                ]
+            } else {
+                vec![m.detected.name.clone(), "Metrics unavailable".into()]
+            };
+            strata_panel(frame, area, " ◆ STRATA ", lines);
+            return;
+        }
         let p = m.perf;
         let focused = i == d.focus;
         let (badge_rgb, badge) = phase_badge(p.phase);
@@ -3623,6 +3975,39 @@ fn with_right<'a>(block: Block<'a>, title: &str, right: Line<'a>, area: Rect) ->
     }
 }
 
+fn strata_scaled(v: &serde_json::Value, key: &str, scale: f64, precision: usize) -> String {
+    crate::strata::number(v, key)
+        .map(|n| format!("{:.*}", precision, n * scale))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn strata_num(v: &serde_json::Value, key: &str, precision: usize) -> String {
+    strata_scaled(v, key, 1.0, precision)
+}
+
+fn strata_gib(v: &serde_json::Value, key: &str) -> String {
+    strata_scaled(v, key, 1.0 / 1_073_741_824.0, 1)
+}
+
+fn strata_text(v: &serde_json::Value, key: &str) -> String {
+    crate::strata::text(v, key)
+        .unwrap_or("—")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+fn strata_panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<String>) {
+    let block = panel(title, pal::CYAN);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .map(|s| Line::styled(s, Style::default().fg(pal::c(pal::TEXT))))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 fn panel(title: &str, accent: (u8, u8, u8)) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -3973,6 +4358,7 @@ fn braille_sparkline(
 fn big_digits(s: String) -> [String; 3] {
     let glyph = |c: char| -> [&'static str; 3] {
         match c {
+            '-' => ["   ", "───", "   "],
             '0' => ["▄▀▄", "█ █", "▀▀▀"],
             '1' => ["▄█ ", " █ ", "▀▀▀"],
             '2' => ["▀▀▄", "▄▀ ", "▀▀▀"],
@@ -4300,6 +4686,72 @@ mod tests {
         let txt: String = fitted.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(txt, "G1 x16 g3…");
         assert_eq!(fit_spans(&[Span::raw("short")], 10).len(), 1);
+    }
+
+    #[test]
+    fn strata_layouts_show_remote_facts_without_simulated_routing() {
+        use ratatui::backend::TestBackend;
+        for (width, height) in [(150, 46), (100, 30), (40, 12)] {
+            for view in [
+                ViewMode::All,
+                ViewMode::Perf,
+                ViewMode::MoE,
+                ViewMode::Bandwidth,
+            ] {
+                let metrics =
+                    crate::strata::parse_metrics(include_str!("../fixtures/strata-busy.json"))
+                        .unwrap();
+                let live = crate::strata::StrataAdapter::default().observe(metrics);
+                let mut perf = PerfTracker::new();
+                perf.observe(&live, Instant::now());
+                let mut model = crate::demo::demo_models(262144, 1).remove(0);
+                model.engine = "strata".into();
+                let fade = FadeState::new();
+                let attention = TokenBuffer::new(10);
+                let generated = GeneratedText::new();
+                let d = Dashboard {
+                    models: &[],
+                    focus: 0,
+                    detected: Some(&model),
+                    gpus: &[],
+                    gpu_error: None,
+                    fade: &fade,
+                    perf: &perf,
+                    live: &live,
+                    attention: &attention,
+                    generated: &generated,
+                    num_layers: 0,
+                    num_heads: 0,
+                    view,
+                    status: "",
+                    theme_name: "defrag",
+                    demo: false,
+                    experts: None,
+                    gpu_backend: None,
+                    settings: None,
+                    log: None,
+                    ctx_speed: None,
+                };
+                let r = Renderer::new(pal::defrag_theme(), 0, 0, 0);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| r.render_view(f, f.area(), &d)).unwrap();
+                let output: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(!output.contains("simulated"));
+                if width >= 100 {
+                    assert!(output.contains("NVIDIA GeForce RTX 3090"));
+                    assert!(output.contains("expert cache 13517 MiB / 6958 slots"));
+                    assert!(output.contains("acceptance unavailable"));
+                    assert!(output.contains("TTFT unavailable"));
+                    assert!(output.contains("parked count unavailable"));
+                }
+            }
+        }
     }
 
     #[test]

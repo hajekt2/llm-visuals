@@ -339,6 +339,7 @@ impl VllmAdapter {
             weight_gb: None,
             kv_cache_gb: None,
             kv_tokens: None,
+            strata: None,
         };
 
         let spec = spec_active.then_some(SpecMetrics {

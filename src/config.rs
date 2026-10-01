@@ -49,6 +49,10 @@ pub struct Args {
     #[arg(long)]
     pub endpoint: Option<String>,
 
+    /// Explicit endpoint backend (auto-detected by default)
+    #[arg(long, value_parser = ["auto", "strata"], default_value = "auto")]
+    pub backend: String,
+
     /// Prompt to generate from
     #[arg(long, default_value = "Once upon a time")]
     pub prompt: String,

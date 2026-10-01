@@ -122,6 +122,8 @@ pub struct LiveStats {
     /// Tokens currently occupying the KV pool (`num_used_tokens`). When
     /// set, `ctx_used` prefers this over prompt+decoded.
     pub kv_tokens: Option<usize>,
+    /// Strata's server-side metrics, including remote hardware and settings.
+    pub strata: Option<crate::strata::StrataMetrics>,
 }
 
 /// Per-request decode count when `/slots` does not carry `n_decoded`.
@@ -431,6 +433,7 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         weight_gb: None,
         kv_cache_gb: None,
         kv_tokens: None,
+        strata: None,
     })
 }
 

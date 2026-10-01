@@ -17,6 +17,7 @@ mod placement;
 mod render;
 mod settings;
 mod sglang;
+mod strata;
 #[cfg(all(test, target_os = "linux"))]
 mod test_support;
 mod vision;
@@ -131,12 +132,23 @@ async fn discover(
     let mut explicit_models = Vec::new();
     let mut explicit_error = None;
     let explicit_ep = args.endpoint_url();
+    if args.backend == "strata" && explicit_ep.is_none() {
+        return (
+            Vec::new(),
+            Some("--backend strata needs --endpoint or --model http://...".into()),
+        );
+    }
 
     // 1. Explicit endpoint URL (--endpoint, --model http://..., or LLM_ENDPOINT)
     if let Some(ref ep) = explicit_ep {
         match model_detect::parse_endpoint(ep) {
             Ok((host, port, path)) => {
-                if let Some(m) = model_detect::probe_endpoint(&host, port, &path, auth).await {
+                let detected = if args.backend == "strata" {
+                    model_detect::probe_strata(&host, port, auth).await
+                } else {
+                    model_detect::probe_endpoint(&host, port, &path, auth).await
+                };
+                if let Some(m) = detected {
                     explicit_models.push(m);
                 } else {
                     explicit_error = Some(format!(
@@ -245,6 +257,18 @@ async fn discover(
         explicit_error = Some(error);
     }
     found.truncate(args.max_models.max(1));
+    for model in &mut found {
+        if model.engine == "strata" && model.pid != 0 {
+            if let Some(port) = model.port {
+                if let Some(info) =
+                    model_detect::probe_strata(&model.host, port, &auth_for(model, auth)).await
+                {
+                    model.name = info.name;
+                    model.ctx_max = info.ctx_max;
+                }
+            }
+        }
+    }
     // `llama-server -hf owner/repo:quant` does not put a local GGUF path on
     // its command line. Current llama.cpp exposes the resolved path via
     // `/props`; use it so layer counts and tensor layout remain available.
@@ -335,6 +359,33 @@ async fn poll_server(
 ) {
     let PollContext { others, auth } = context;
     let pid = model.key();
+    if model.engine == "strata" {
+        let mut adapter = strata::StrataAdapter::default();
+        let mut misses = 0u32;
+        loop {
+            let stats = match strata::poll_metrics(&model.host, port, &auth).await {
+                Some(m) => {
+                    misses = 0;
+                    adapter.observe(m)
+                }
+                None => {
+                    misses = misses.saturating_add(1);
+                    // Clear stale remote metrics immediately, not a frozen busy
+                    // request. A subsequent successful scrape recovers unaided.
+                    LiveStats::default()
+                }
+            };
+            if live_tx.send((pid, stats)).await.is_err() {
+                return;
+            }
+            let delay = if misses >= 3 {
+                poll.max(Duration::from_secs(2))
+            } else {
+                poll.max(Duration::from_millis(200))
+            };
+            tokio::time::sleep(delay).await;
+        }
+    }
     if model.engine == "sglang" {
         // SGLang has no /slots. /v1/loads is always on; /server_info is
         // fetched once at attach. Each poll is a line in SGLang's access
@@ -1035,6 +1086,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if s.ctx_max > 0 {
                     slot.ctx_max = s.ctx_max;
                 }
+                if let Some(m) = &s.strata {
+                    if let Some(name) = strata::text(&m.engine, "model") {
+                        slot.model.name = name.to_string();
+                    }
+                    slot.model.ctx_max = m.context_max();
+                }
                 slot.perf.observe(&s, now);
                 slot.live = s;
             }
@@ -1515,6 +1572,105 @@ mod tests {
             }
         });
         (port, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn strata_auto_and_explicit_discovery() {
+        for backend in ["auto", "strata"] {
+            let (port, _shutdown) =
+                spawn_mock_server("{}", include_str!("../fixtures/strata-idle.json")).await;
+            let ep = format!("http://127.0.0.1:{port}");
+            let args =
+                Args::try_parse_from(["llm-visuals", "--endpoint", &ep, "--backend", backend])
+                    .unwrap();
+            let (models, err) = discover(&args, &HttpAuth::default()).await;
+            assert!(err.is_none(), "{err:?}");
+            let m = models.iter().find(|m| m.port == Some(port)).unwrap();
+            assert_eq!(m.engine, "strata");
+            assert_eq!(m.name, "Qwen3.8-Flash-Next-IQ3_S");
+            assert_eq!(m.ctx_max, Some(262144));
+        }
+        let args = Args::try_parse_from(["llm-visuals", "--backend", "strata"]).unwrap();
+        let (_, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.unwrap().contains("needs --endpoint"));
+    }
+
+    #[tokio::test]
+    async fn strata_poller_recovers_and_clears_failed_scrapes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stage = Arc::new(AtomicUsize::new(0));
+        let state = stage.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /metrics HTTP/1.1"));
+                let (status, body) = match state.load(Ordering::SeqCst) {
+                    0 => ("200 OK", include_str!("../fixtures/strata-busy.json")),
+                    1 => (
+                        "503 Service Unavailable",
+                        include_str!("../fixtures/strata-error.json"),
+                    ),
+                    _ => ("200 OK", include_str!("../fixtures/strata-idle.json")),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let model = model_detect::probe_strata("127.0.0.1", port, &HttpAuth::default())
+            .await
+            .unwrap();
+        let (live_tx, mut live_rx) = mpsc::channel(16);
+        let (spec_tx, _) = mpsc::channel(16);
+        let (expert_tx, _) = mpsc::channel(16);
+        let task = tokio::spawn(poll_server(
+            model,
+            port,
+            live_tx,
+            spec_tx,
+            expert_tx,
+            PollContext {
+                others: vec![],
+                auth: HttpAuth::default(),
+            },
+            Duration::from_millis(200),
+        ));
+        let (_, live) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(live.processing && live.strata.is_some());
+        stage.store(1, Ordering::SeqCst);
+        loop {
+            let (_, s) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if s.strata.is_none() {
+                assert!(!s.processing);
+                break;
+            }
+        }
+        // The same poller and endpoint recover without a rescan or new task.
+        stage.store(2, Ordering::SeqCst);
+        loop {
+            let (_, s) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if s.strata.is_some() {
+                assert!(!s.processing);
+                break;
+            }
+        }
+        task.abort();
+        server.abort();
     }
 
     #[tokio::test]

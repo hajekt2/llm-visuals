@@ -607,8 +607,51 @@ impl PerfTracker {
         }
     }
 
+    /// Strata supplies windowed rates and server-lifetime totals directly.
+    /// Its recent requests are rendered from /metrics, not reconstructed from
+    /// polling edges (which cannot measure TTFT or recover live prefix reuse).
+    fn observe_strata(&mut self, m: &crate::strata::StrataMetrics, now: Instant) {
+        self.phase = match m.state() {
+            "reading" => Phase::Prefill,
+            "generating" => Phase::Decode,
+            _ => Phase::Idle,
+        };
+        self.decode_tps = m.decode_rate().unwrap_or(0.0);
+        self.prefill_tps = m.prefill_rate().unwrap_or(0.0);
+        let smooth =
+            |prev: f32, value: f32| prev + (value - prev) * if value > prev { 0.5 } else { 0.25 };
+        self.decode_tps_smooth = smooth(self.decode_tps_smooth, self.decode_tps);
+        self.prefill_tps_smooth = smooth(self.prefill_tps_smooth, self.prefill_tps);
+        self.peak_decode_tps = self.peak_decode_tps.max(self.decode_tps);
+        self.peak_prefill_tps = self.peak_prefill_tps.max(self.prefill_tps);
+        push(&mut self.decode_hist, self.decode_tps);
+        push(&mut self.prefill_hist, self.prefill_tps);
+        self.session_requests = crate::strata::number(&m.totals, "requests").unwrap_or(0.0) as u64;
+        self.session_decoded =
+            crate::strata::number(&m.totals, "output_tokens").unwrap_or(0.0) as u64;
+        self.session_prefilled = crate::strata::number(&m.totals, "prompt_tokens")
+            .zip(crate::strata::number(&m.totals, "reused"))
+            .map(|(prompt, reused)| (prompt - reused).max(0.0) as u64)
+            .unwrap_or(0);
+        // Do not attribute this remote server's energy to local GPUs.
+        self.total_power_w = crate::strata::number(&m.hardware, "gpu_power").unwrap_or(0.0) as f32;
+        let dt = self
+            .last_sample
+            .as_ref()
+            .map(|(t, _)| (now - *t).as_secs_f32())
+            .unwrap_or(0.0);
+        self.bw.decode.update(self.decode_tps, now, dt);
+        self.bw.prefill.update(self.prefill_tps, now, dt);
+    }
+
     pub fn observe(&mut self, s: &LiveStats, now: Instant) {
         self.samples += 1;
+        if let Some(m) = &s.strata {
+            self.poll_ok = true;
+            self.observe_strata(m, now);
+            self.last_sample = Some((now, s.clone()));
+            return;
+        }
         self.poll_ok = true;
         let Some((t0, prev)) = self.last_sample.clone() else {
             self.last_sample = Some((now, s.clone()));
