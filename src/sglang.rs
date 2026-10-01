@@ -386,6 +386,7 @@ impl SglangAdapter {
             weight_gb: c.weight_gb,
             kv_cache_gb: c.kv_cache_gb,
             kv_tokens: Some(used),
+            strata: None,
         };
 
         // (generated_total, steps_total) so the caller can apply
