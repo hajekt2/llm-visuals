@@ -193,7 +193,7 @@ async fn discover(
                     && fm
                         .vision
                         .as_ref()
-                        .map_or(true, |v| v.place == vision::Place::Unknown)
+                        .is_none_or(|v| v.place == vision::Place::Unknown)
                 {
                     fm.vision = m.vision;
                 }

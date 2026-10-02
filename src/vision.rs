@@ -21,8 +21,8 @@ pub const CUDA_PROBE_ARG: &str = "--cuda-bus-ids";
 pub enum Place {
     Cpu,
     /// One GPU. `device` is the engine's own name for it (llama.cpp's
-    /// `CUDA0`), `gpu` the host index in nvidia-smi numbering when it could
-    /// be resolved.
+    /// `CUDA0`), `gpu` the dashboard's global device index when it could
+    /// be resolved (NVIDIA retains nvidia-smi numbering).
     Gpu {
         device: Option<String>,
         gpu: Option<u32>,
@@ -267,7 +267,9 @@ pub fn llama_place(
     }
     Place::Gpu {
         device: Some(format!("{family}{ordinal}")),
-        gpu: gpu.or(single),
+        // A loaded CUDA library is not evidence that the server uses a
+        // NVIDIA card: Vulkan enumeration can map several vendor runtimes.
+        gpu: gpu.filter(|index| gpu_indices.contains(index)).or(single),
     }
 }
 
