@@ -693,6 +693,8 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
         }
     }
 
+    fold_strata_workers(&mut by_pid, parent_pid);
+
     // Engines pinned by environment (ZE_AFFINITY_MASK on Intel, which has
     // no compute-app table) have no driver-reported placement; recover it
     // from /proc/<pid>/environ. Only as a fallback: driver indices are
@@ -1304,6 +1306,49 @@ fn cmdline_of(p: &sysinfo::Process) -> Option<String> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     (!args.is_empty()).then(|| args.join(" "))
+}
+
+/// Strata's HTTP adapter launches the native engine as a subprocess. The
+/// child holds VRAM, the Python adapter owns the endpoint; show one server.
+fn fold_strata_workers(
+    models: &mut std::collections::HashMap<u32, DetectedModel>,
+    parent: impl Fn(u32) -> Option<u32>,
+) {
+    let workers: Vec<_> = models
+        .values()
+        .filter(|m| {
+            m.engine == "strata"
+                && Path::new(&m.process_name)
+                    .file_name()
+                    .is_some_and(|n| n == "strata")
+        })
+        .filter_map(|m| {
+            server_ancestor(
+                m.pid,
+                |pid| models.get(&pid).is_some_and(|m| m.engine == "strata"),
+                &parent,
+            )
+            .map(|server| (m.pid, server))
+        })
+        .collect();
+    for (worker, server) in workers {
+        let Some(worker) = models.remove(&worker) else {
+            continue;
+        };
+        let Some(server) = models.get_mut(&server) else {
+            continue;
+        };
+        server.mem_used_mb = server.mem_used_mb.saturating_add(worker.mem_used_mb);
+        for gpu in worker.gpu_indices {
+            if !server.gpu_indices.contains(&gpu) {
+                server.gpu_indices.push(gpu);
+            }
+        }
+        if worker.path.is_some() {
+            server.path = worker.path;
+            server.name = worker.name;
+        }
+    }
 }
 
 fn add_gpu_app(model: &mut DetectedModel, app: &ComputeApp) {
@@ -2251,6 +2296,29 @@ mod tests {
     }
 
     #[test]
+    fn strata_native_worker_folds_onto_the_http_adapter() {
+        let mut server = crate::demo::demo_models(8192, 1).remove(0);
+        server.pid = 100;
+        server.engine = "strata".into();
+        server.process_name = "python".into();
+        server.gpu_indices.clear();
+        server.mem_used_mb = 0;
+        let mut worker = server.clone();
+        worker.pid = 200;
+        worker.process_name = "/opt/strata/build/strata".into();
+        worker.name = "Flash-Next".into();
+        worker.path = Some("/models/flash-next.gguf".into());
+        worker.gpu_indices = vec![0];
+        worker.mem_used_mb = 23_412;
+        let mut models = std::collections::HashMap::from([(100, server), (200, worker)]);
+        fold_strata_workers(&mut models, |pid| (pid == 200).then_some(100));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[&100].name, "Flash-Next");
+        assert_eq!(models[&100].gpu_indices, vec![0]);
+        assert_eq!(models[&100].mem_used_mb, 23_412);
+    }
+
+    #[test]
     fn worker_placement_folds_to_host_visible_server() {
         let parent = |pid| match pid {
             300 => Some(200),
@@ -2444,7 +2512,12 @@ mod tests {
         // served model is a safetensors dir: either GGUF or HF config
         // metadata has to provide real numbers.
         assert!(
-            models.iter().all(|m| m.n_layers() > 1),
+            // A Strata PLE-only shard need not contain the full model's
+            // topology. Do not invent one from its packed weight bytes.
+            models
+                .iter()
+                .filter(|m| m.engine != "strata")
+                .all(|m| m.n_layers() > 1),
             "layer count fell back to 1 — topology metadata missing"
         );
     }
