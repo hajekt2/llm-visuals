@@ -341,7 +341,7 @@ impl VllmAdapter {
             kv_tokens: None,
         };
 
-        let spec = spec_active.then(|| SpecMetrics {
+        let spec = spec_active.then_some(SpecMetrics {
             draft_tokens: c.spec_draft_tokens as u64,
             accepted: c.spec_accepted as u64,
             verify_steps: c.spec_drafts as u64,

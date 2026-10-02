@@ -654,7 +654,7 @@ impl PerfTracker {
                     // server's own timeline: TTFT + total inter-token
                     // time spans admission -> last token. `ended`
                     // keeps the detection time.
-                    if done.ttft.map_or(false, |t| t > 0.0) {
+                    if done.ttft.is_some_and(|t| t > 0.0) {
                         let e2e = close.ttft_secs + close.itl_sum;
                         if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                             done.started = st;
@@ -773,7 +773,7 @@ impl PerfTracker {
                 // total inter-token time is the request's true wall
                 // span (admission -> last token). llama.cpp rows have
                 // no histograms and keep the detection-based span.
-                if done.ttft.map_or(false, |t| t > 0.0) {
+                if done.ttft.is_some_and(|t| t > 0.0) {
                     let e2e = done.ttft.unwrap() as f64 + done.itl_sum.unwrap_or(0.0) as f64;
                     if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                         done.started = st;
@@ -913,6 +913,8 @@ mod tests {
     /// vLLM-shaped slot: counters jump only at completion; the
     /// optional `closing` view is what the adapter hands over when a
     /// completion and a successor's admission share one poll.
+    // Fixture mirrors the independent server counters used by these tests.
+    #[allow(clippy::too_many_arguments)]
     fn vllm_slot(
         id: i64,
         processing: bool,

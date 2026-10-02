@@ -9,7 +9,14 @@ use crate::nvml::NvmlSession;
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct GpuStats {
+    /// Stable dashboard index; local_index is the vendor's device ordinal.
     pub index: u32,
+    pub local_index: u32,
+    pub backend: &'static str,
+    /// Retain host topology even when --gpu filters the other vendor out.
+    pub mixed_host: bool,
+    pub pci_address: Option<String>,
+    pub telemetry_error: Option<String>,
     pub name: String,
     pub utilization_gpu: f32, // %
     pub utilization_mem: f32, // %
@@ -82,9 +89,8 @@ impl GpuStats {
 /// One poll: the stats, or the reason no supported GPU backend produced data.
 pub type GpuSample = Result<Vec<GpuStats>, String>;
 
-/// Collects GPU stats every 200ms from whichever backend is detected:
-/// in-process NVML or nvidia-smi (NVIDIA), xpu-smi (Intel), or Linux amdgpu
-/// sysfs (AMD).
+/// Collects every available vendor every 200ms. NVIDIA uses NVML or smi,
+/// AMD uses sysfs/hwmon, and Intel uses xpu-smi.
 pub struct GpuMonitor {
     interval: Duration,
     backend: Arc<GpuBackend>,
@@ -95,6 +101,13 @@ pub enum GpuBackend {
     NvidiaSmi,
     Xpu,
     Amd(Vec<AmdDevice>),
+    Mixed(Vec<GpuGroup>),
+}
+
+/// Startup inventory fixes index allocation even when a later poll fails.
+pub struct GpuGroup {
+    backend: GpuBackend,
+    devices: Vec<GpuStats>,
 }
 
 pub struct AmdDevice {
@@ -280,48 +293,167 @@ fn parse_xpu_csv(text: &str) -> Vec<GpuStats> {
 
 impl GpuBackend {
     pub fn detect(nvml: Option<Arc<NvmlSession>>) -> Self {
-        if let Some(session) = nvml {
-            if session.collect_stats().is_ok_and(|gpus| !gpus.is_empty()) {
-                return Self::Nvml(session);
+        let mut sources = Vec::new();
+        let nvidia = nvml
+            .and_then(|session| {
+                session
+                    .collect_stats()
+                    .ok()
+                    .filter(|g| !g.is_empty())
+                    .map(|g| (Self::Nvml(session), g))
+            })
+            .or_else(|| {
+                GpuMonitor::collect_nvidia()
+                    .ok()
+                    .filter(|g| !g.is_empty())
+                    .map(|g| (Self::NvidiaSmi, g))
+            });
+        if let Some(source) = nvidia {
+            sources.push(source);
+        }
+        let amd = amd_devices();
+        if let Ok(stats) = collect_amd(&amd) {
+            sources.push((Self::Amd(amd), stats));
+        }
+        if let Ok(stats) = GpuMonitor::collect_xpu() {
+            if !stats.is_empty() {
+                sources.push((Self::Xpu, stats));
             }
         }
-        if GpuMonitor::collect_nvidia().is_ok_and(|gpus| !gpus.is_empty()) {
-            Self::NvidiaSmi
-        } else if GpuMonitor::collect_xpu().is_ok_and(|gpus| !gpus.is_empty()) {
-            Self::Xpu
-        } else {
-            let devices = amd_devices();
-            if devices.is_empty() {
-                // Preserve nvidia-smi's useful error when no backend exists.
-                Self::NvidiaSmi
-            } else {
-                Self::Amd(devices)
-            }
-        }
+        Self::from_sources(sources)
     }
 
-    pub fn name(&self) -> &'static str {
+    fn from_sources(mut sources: Vec<(Self, Vec<GpuStats>)>) -> Self {
+        if sources.len() <= 1 {
+            // Keep single-vendor ordinals and backend names unchanged.
+            return sources.pop().map(|(b, _)| b).unwrap_or(Self::NvidiaSmi);
+        }
+        let mut next = 0;
+        let groups = sources
+            .into_iter()
+            .enumerate()
+            .map(|(vendor, (backend, stats))| {
+                let devices = stats
+                    .into_iter()
+                    .map(|mut g| {
+                        g.local_index = g.index;
+                        g.backend = backend.label();
+                        g.mixed_host = true;
+                        if vendor != 0 {
+                            g.index = next;
+                        }
+                        next = next.max(g.index + 1);
+                        g
+                    })
+                    .collect();
+                GpuGroup { backend, devices }
+            })
+            .collect();
+        Self::Mixed(groups)
+    }
+
+    fn label(&self) -> &'static str {
         match self {
             Self::Nvml(_) => "nvml",
             Self::NvidiaSmi => "smi",
             Self::Xpu => "xpu",
             Self::Amd(_) => "amd",
+            Self::Mixed(_) => "mixed",
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Self::Mixed(groups) => groups
+                .iter()
+                .map(|g| g.backend.label())
+                .collect::<Vec<_>>()
+                .join("+"),
+            _ => self.label().to_string(),
+        }
+    }
+
+    pub fn nvml(&self) -> Option<Arc<NvmlSession>> {
+        match self {
+            Self::Nvml(session) => Some(session.clone()),
+            Self::Mixed(groups) => groups.iter().find_map(|g| g.backend.nvml()),
+            _ => None,
+        }
+    }
+
+    pub fn inventory(&self) -> Vec<GpuStats> {
+        match self {
+            Self::Mixed(groups) => groups.iter().flat_map(|g| g.devices.clone()).collect(),
+            _ => self.collect().unwrap_or_default(),
         }
     }
 
     pub fn collect(&self) -> Result<Vec<GpuStats>, String> {
-        match self {
+        let mut stats = match self {
             Self::Nvml(session) => session.collect_stats(),
             Self::NvidiaSmi => GpuMonitor::collect_nvidia(),
             Self::Xpu => GpuMonitor::collect_xpu(),
             Self::Amd(devices) => collect_amd(devices),
+            Self::Mixed(groups) => return Ok(collect_groups(groups, GpuBackend::collect)),
+        }?;
+        for g in &mut stats {
+            g.local_index = g.index;
+            g.backend = self.label();
         }
+        Ok(stats)
     }
+}
+
+fn collect_groups(
+    groups: &[GpuGroup],
+    collect: impl Fn(&GpuBackend) -> GpuSample,
+) -> Vec<GpuStats> {
+    groups
+        .iter()
+        .flat_map(|g| merge_sample(&g.devices, collect(&g.backend)))
+        .collect()
+}
+
+/// Preserve a missing vendor's slots, not its stale counters. Never renumber
+/// the healthy vendor when a driver temporarily stops answering.
+fn merge_sample(devices: &[GpuStats], sample: GpuSample) -> Vec<GpuStats> {
+    devices
+        .iter()
+        .map(|device| {
+            let mut g = sample
+                .as_ref()
+                .ok()
+                .and_then(|stats| stats.iter().find(|g| g.local_index == device.local_index))
+                .cloned()
+                .unwrap_or_else(|| GpuStats {
+                    name: device.name.clone(),
+                    pci_address: device.pci_address.clone(),
+                    telemetry_error: Some(
+                        sample
+                            .as_ref()
+                            .err()
+                            .cloned()
+                            .unwrap_or_else(|| "device unavailable".into()),
+                    ),
+                    ..Default::default()
+                });
+            g.index = device.index;
+            g.local_index = device.local_index;
+            g.backend = device.backend;
+            g.mixed_host = device.mixed_host;
+            g
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
 fn amd_devices() -> Vec<AmdDevice> {
-    amd_device_paths()
+    amd_devices_at(Path::new("/sys/class/drm"))
+}
+
+#[cfg(target_os = "linux")]
+fn amd_devices_at(root: &Path) -> Vec<AmdDevice> {
+    amd_device_paths(root)
         .into_iter()
         .enumerate()
         .map(|(index, path)| AmdDevice {
@@ -338,8 +470,8 @@ fn amd_devices() -> Vec<AmdDevice> {
 }
 
 #[cfg(target_os = "linux")]
-fn amd_device_paths() -> Vec<PathBuf> {
-    let mut devices: Vec<PathBuf> = std::fs::read_dir("/sys/class/drm")
+fn amd_device_paths(root: &Path) -> Vec<PathBuf> {
+    let mut devices: Vec<PathBuf> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
@@ -354,13 +486,20 @@ fn amd_device_paths() -> Vec<PathBuf> {
             (read_trimmed(device.join("vendor")).as_deref() == Some("0x1002")).then_some(device)
         })
         .collect();
-    devices.sort();
+    devices.sort_by_key(|path| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("card"))
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
     devices
 }
 
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-fn amd_device_paths() -> Vec<PathBuf> {
+fn amd_device_paths(_root: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -374,9 +513,6 @@ fn collect_amd(devices: &[AmdDevice]) -> Result<Vec<GpuStats>, String> {
         .enumerate()
         .map(|(index, device)| amd_stats(index as u32, device))
         .collect();
-    if stats.iter().all(|gpu| gpu.mem_total_mb == 0) {
-        return Err("AMD GPUs found, but amdgpu telemetry is unreadable".into());
-    }
     Ok(stats)
 }
 
@@ -401,6 +537,11 @@ fn amd_stats(index: u32, device: &AmdDevice) -> GpuStats {
         .unwrap_or(0);
     GpuStats {
         index,
+        local_index: index,
+        backend: "amd",
+        mixed_host: false,
+        pci_address: pci_address(path),
+        telemetry_error: (mem_total_mb == 0).then(|| "amdgpu telemetry unreadable".into()),
         name: device.name.clone(),
         utilization_gpu: read_f32(path.join("gpu_busy_percent")),
         utilization_mem: read_f32(path.join("mem_busy_percent")),
@@ -452,12 +593,14 @@ fn amd_hwmon(hwmon: Option<&Path>) -> (Option<f32>, f32, f32, Option<f32>) {
     (temperature, power_watts, power_max_watts, fan_pct)
 }
 
+pub(crate) fn pci_address(device: &Path) -> Option<String> {
+    read_trimmed(device.join("uevent"))?
+        .lines()
+        .find_map(|line| line.strip_prefix("PCI_SLOT_NAME=").map(str::to_owned))
+}
+
 fn amd_name(device: &Path, index: u32) -> String {
-    let slot = read_trimmed(device.join("uevent")).and_then(|text| {
-        text.lines()
-            .find_map(|line| line.strip_prefix("PCI_SLOT_NAME="))
-            .map(str::to_owned)
-    });
+    let slot = pci_address(device);
     if let Some(slot) = slot {
         if let Ok(output) = std::process::Command::new("lspci")
             .args(["-s", &slot])
@@ -546,6 +689,7 @@ pub fn parse_csv(stdout: &str) -> Vec<GpuStats> {
 
         stats.push(GpuStats {
             index: int(0) as u32,
+            local_index: int(0) as u32,
             name: parts[1].to_string(),
             mem_total_mb: int(2),
             mem_used_mb: int(3),
@@ -563,9 +707,24 @@ pub fn parse_csv(stdout: &str) -> Vec<GpuStats> {
             util_estimated: false,
             pcie_gen: int(14) as u32,
             pcie_width: int(15) as u32,
+            ..Default::default()
         });
     }
     stats
+}
+
+/// Backend labels distinguish vendors without guessing from marketing names.
+pub fn is_mixed(stats: &[GpuStats]) -> bool {
+    let vendor = |label| match label {
+        "nvml" | "smi" => "nvidia",
+        other => other,
+    };
+    stats.iter().any(|g| g.mixed_host)
+        || stats.first().is_some_and(|first| {
+            stats
+                .iter()
+                .any(|g| vendor(g.backend) != vendor(first.backend))
+        })
 }
 
 pub fn filter_gpus(stats: Vec<GpuStats>, filter: &[usize]) -> Vec<GpuStats> {
@@ -662,6 +821,7 @@ impl DemoGpu {
             },
             pcie_gen: 3,
             pcie_width: if self.index == 0 { 8 } else { 16 },
+            ..Default::default()
         }
     }
 }
@@ -669,6 +829,147 @@ impl DemoGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mixed_collection_preserves_slots_across_failures() {
+        let host = crate::test_support::MixedHost::new();
+        let amd = amd_devices_at(&host.root.join("sys/class/drm"));
+        let a = collect_amd(&amd).unwrap();
+        let n = parse_csv(include_str!("../fixtures/mixed-gpu/nvidia-smi.csv"));
+        let backend = GpuBackend::from_sources(vec![
+            (GpuBackend::NvidiaSmi, n.clone()),
+            (GpuBackend::Amd(amd), a.clone()),
+        ]);
+        assert_eq!(backend.name(), "smi+amd");
+        assert_eq!(
+            backend
+                .inventory()
+                .iter()
+                .map(|g| (g.index, g.local_index, g.backend))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, "smi"), (1, 0, "amd")]
+        );
+        assert!(is_mixed(&filter_gpus(backend.inventory(), &[1])));
+        let GpuBackend::Mixed(groups) = backend else {
+            panic!("not mixed")
+        };
+        for failing in [None, Some("smi"), Some("amd")] {
+            let stats = collect_groups(&groups, |b| {
+                if failing == Some(b.label()) {
+                    return Err("driver failed".into());
+                }
+                if b.label() == "smi" {
+                    Ok(n.clone())
+                } else {
+                    b.collect()
+                }
+            });
+            assert_eq!(stats.len(), 2);
+            assert_eq!(
+                stats.iter().map(|g| g.index).collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            for g in &stats {
+                assert_eq!(g.telemetry_error.is_some(), failing == Some(g.backend));
+                if g.telemetry_error.is_some() {
+                    assert_eq!(g.mem_used_mb, 0);
+                }
+            }
+            if failing != Some("amd") {
+                assert_eq!(stats[1].mem_used_mb, 16_384);
+                assert_eq!(stats[1].utilization_gpu, 72.0);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn single_vendor_names_and_indices_are_unchanged() {
+        let host = crate::test_support::MixedHost::new();
+        let devices = amd_devices_at(&host.root.join("sys/class/drm"));
+        let stats = collect_amd(&devices).unwrap();
+        let backend = GpuBackend::from_sources(vec![(GpuBackend::Amd(devices), stats)]);
+        assert_eq!(backend.name(), "amd");
+        assert_eq!(backend.collect().unwrap()[0].index, 0);
+        let n = parse_csv(include_str!("../fixtures/mixed-gpu/nvidia-smi.csv"));
+        assert_eq!(
+            GpuBackend::from_sources(vec![(GpuBackend::NvidiaSmi, n)]).name(),
+            "smi"
+        );
+        assert_eq!(
+            GpuBackend::from_sources(vec![(GpuBackend::Xpu, vec![GpuStats::default()])]).name(),
+            "xpu"
+        );
+        assert_eq!(GpuBackend::from_sources(vec![]).name(), "smi");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unreadable_amd_remains_visible_and_cards_sort_numerically() {
+        let host = crate::test_support::MixedHost::new();
+        host.write("sys/class/drm/card10/device/vendor", "0x1002\n");
+        host.write("sys/class/drm/card10/device/device", "0x744c\n");
+        let amd = amd_devices_at(&host.root.join("sys/class/drm"));
+        assert!(amd[0].path.ends_with("card2/device"));
+        assert!(amd[1].path.ends_with("card10/device"));
+        let stats = collect_amd(&amd).unwrap();
+        assert_eq!(stats.len(), 2);
+        assert!(stats[0].telemetry_error.is_none());
+        assert!(stats[1].telemetry_error.is_some());
+        let n = parse_csv(include_str!("../fixtures/mixed-gpu/nvidia-smi.csv"));
+        let inventory = GpuBackend::from_sources(vec![
+            (GpuBackend::NvidiaSmi, n),
+            (GpuBackend::Amd(amd), stats),
+        ])
+        .inventory();
+        assert_eq!(
+            inventory.iter().map(|g| g.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn three_vendors_have_unique_global_and_preserved_local_indices() {
+        let backend = GpuBackend::from_sources(vec![
+            (
+                GpuBackend::NvidiaSmi,
+                vec![GpuStats {
+                    index: 2,
+                    ..Default::default()
+                }],
+            ),
+            (
+                GpuBackend::Amd(vec![]),
+                vec![GpuStats {
+                    index: 0,
+                    ..Default::default()
+                }],
+            ),
+            (
+                GpuBackend::Xpu,
+                vec![
+                    GpuStats {
+                        index: 0,
+                        ..Default::default()
+                    },
+                    GpuStats {
+                        index: 3,
+                        ..Default::default()
+                    },
+                ],
+            ),
+        ]);
+        assert_eq!(backend.name(), "smi+amd+xpu");
+        assert_eq!(
+            backend
+                .inventory()
+                .iter()
+                .map(|g| (g.index, g.local_index))
+                .collect::<Vec<_>>(),
+            vec![(2, 2), (3, 0), (4, 0), (5, 3)]
+        );
+    }
 
     #[test]
     fn parse_real_nvidia_smi_line() {

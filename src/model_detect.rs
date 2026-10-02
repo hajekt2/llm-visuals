@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::gguf::{self, GgufInfo};
+use crate::gpu::GpuStats;
 use crate::vision::{self, Place, Vision};
 
 /// Information about a detected running LLM process
@@ -102,6 +103,54 @@ impl DetectedModel {
             }
         }
         parts.join("-")
+    }
+
+    /// Estimated weight share, constrained by observed placement. A visibility
+    /// mask or a tensor split must never claim an unrelated vendor's VRAM.
+    pub fn gpu_share(&self, index: u32, gpus: &[GpuStats]) -> f32 {
+        if self.n_gpu_layers == Some(0) {
+            return 0.0;
+        }
+        let position = if self.gpu_indices.is_empty() {
+            if crate::gpu::is_mixed(gpus) {
+                return 0.0;
+            }
+            index as usize
+        } else {
+            let Some(position) = self.gpu_indices.iter().position(|&g| g == index) else {
+                return 0.0;
+            };
+            position
+        };
+        if self.tensor_split.is_empty() {
+            let count = if self.gpu_indices.is_empty() {
+                gpus.len()
+            } else {
+                self.gpu_indices.len()
+            };
+            return 1.0 / count.max(1) as f32;
+        }
+        let active: Vec<f32> = self
+            .tensor_split
+            .iter()
+            .copied()
+            .filter(|s| *s > 0.0)
+            .collect();
+        let split = if !self.gpu_indices.is_empty() && active.len() == self.gpu_indices.len() {
+            &active
+        } else {
+            &self.tensor_split
+        };
+        split.get(position).copied().unwrap_or(0.0) / split.iter().sum::<f32>().max(1.0)
+    }
+
+    pub fn uses_gpu(&self, index: u32, gpus: &[GpuStats]) -> bool {
+        self.n_gpu_layers != Some(0)
+            && if self.gpu_indices.is_empty() {
+                !crate::gpu::is_mixed(gpus)
+            } else {
+                self.gpu_indices.contains(&index)
+            }
     }
 
     /// Whether this looks like a bare daemon with nothing loaded.
@@ -230,11 +279,7 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
             continue;
         }
         let mp = unescape_mount(f[4]);
-        if target.starts_with(&mp)
-            && best
-                .as_ref()
-                .map_or(true, |(_, _, bmp)| mp.len() > bmp.len())
-        {
+        if target.starts_with(&mp) && best.as_ref().is_none_or(|(_, _, bmp)| mp.len() > bmp.len()) {
             best = Some((f[2].to_string(), unescape_mount(f[3]), mp));
         }
     }
@@ -248,7 +293,7 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
         let f: Vec<&str> = line.splitn(6, ' ').collect();
         if f.len() >= 6 && f[2] == dev {
             let hmp = unescape_mount(f[4]);
-            if host_prefix.as_ref().map_or(true, |p| hmp.len() > p.len()) {
+            if host_prefix.as_ref().is_none_or(|p| hmp.len() > p.len()) {
                 host_prefix = Some(hmp);
             }
         }
@@ -542,34 +587,27 @@ fn is_ipv4(s: &str) -> bool {
 /// Scan GPU compute apps + process cmdlines for inference servers.
 /// Every server found is returned, best first; the caller decides how many
 /// to monitor.
-pub fn detect_models() -> Vec<DetectedModel> {
-    let mut gpu_procs = nvidia_compute_apps();
-    if gpu_procs.is_empty() {
-        gpu_procs = amd_compute_apps();
-    }
+pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
+    let mut gpu_procs = nvidia_compute_apps(inventory);
+    gpu_procs.extend(amd_compute_apps(inventory));
     let mut by_pid: std::collections::HashMap<u32, DetectedModel> =
         std::collections::HashMap::new();
-    // SGLang workers hold the GPU memory; fold it onto the launcher PID.
-    let mut worker_gpu: std::collections::HashMap<u32, (u64, Vec<u32>)> =
-        std::collections::HashMap::new();
+    // Worker process names / inherited argv need not identify a server.
+    // Defer them until the /proc scan has found their host-visible launcher.
+    let mut worker_apps = Vec::new();
 
     for app in gpu_procs {
         let cmdline = read_cmdline(app.pid).unwrap_or_else(|| app.process_name.clone());
-        if is_sglang_worker(&app.process_name) {
-            if let Some(ppid) = parent_pid(app.pid) {
-                let e = worker_gpu.entry(ppid).or_insert((0, Vec::new()));
-                e.0 = e.0.saturating_add(app.mem_used_mb);
-                if !e.1.contains(&app.gpu_index) {
-                    e.1.push(app.gpu_index);
-                }
-            }
+        if is_self(app.pid, &cmdline) {
             continue;
         }
-        if !looks_like_llm(&app.process_name, &cmdline) || is_self(app.pid, &cmdline) {
+        if is_sglang_worker(&app.process_name) || !looks_like_llm(&app.process_name, &cmdline) {
+            worker_apps.push(app);
             continue;
         }
         let mut parsed = parse_cmdline(&app.process_name, &cmdline);
         if parsed.engine == "vllm" && is_vllm_phantom(&app.process_name, &cmdline) {
+            worker_apps.push(app);
             continue;
         }
         if parsed.engine == "vllm" {
@@ -597,10 +635,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
             tensors: None,
             vision: None,
         });
-        if !entry.gpu_indices.contains(&app.gpu_index) {
-            entry.gpu_indices.push(app.gpu_index);
-        }
-        entry.mem_used_mb = entry.mem_used_mb.saturating_add(app.mem_used_mb);
+        add_gpu_app(entry, &app);
     }
 
     // /proc scan for engines that might not appear in nvidia-smi
@@ -652,14 +687,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
         );
     }
 
-    for (ppid, (mem, gpus)) in worker_gpu {
-        if let Some(m) = by_pid.get_mut(&ppid) {
-            m.mem_used_mb = m.mem_used_mb.saturating_add(mem);
-            for g in gpus {
-                if !m.gpu_indices.contains(&g) {
-                    m.gpu_indices.push(g);
-                }
-            }
+    for app in worker_apps {
+        if let Some(pid) = server_ancestor(app.pid, |pid| by_pid.contains_key(&pid), parent_pid) {
+            add_gpu_app(by_pid.get_mut(&pid).unwrap(), &app);
         }
     }
 
@@ -670,7 +700,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
     // to the devices passed through.
     for m in by_pid.values_mut() {
         if m.gpu_indices.is_empty() {
-            m.gpu_indices = env_gpu_affinity(m.pid);
+            m.gpu_indices = env_gpu_affinity(m.pid, inventory);
         }
     }
 
@@ -1195,10 +1225,41 @@ fn walk_proc_llms() -> Vec<(u32, String, String)> {
 /// (`CUDA_VISIBLE_DEVICES`, or `ZE_AFFINITY_MASK` for Intel Level Zero).
 /// Empty when neither is set or /proc/<pid>/environ is unreadable (needs
 /// the same uid or root).
-fn env_gpu_affinity(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/environ"))
-        .map(|env| parse_gpu_affinity(&env))
-        .unwrap_or_default()
+fn env_gpu_affinity(pid: u32, inventory: &[GpuStats]) -> Vec<u32> {
+    let Ok(env) = std::fs::read_to_string(format!("/proc/{pid}/environ")) else {
+        return Vec::new();
+    };
+    resolve_gpu_affinity(&env, inventory)
+}
+
+fn resolve_gpu_affinity(env: &str, inventory: &[GpuStats]) -> Vec<u32> {
+    // Visibility grants access, not proof of use. In particular, a CUDA
+    // mask inherited by a Vulkan server must not claim its NVIDIA neighbor.
+    if crate::gpu::is_mixed(inventory) {
+        return Vec::new();
+    }
+    let Some(first) = inventory.first() else {
+        return Vec::new();
+    };
+    let key = match first.backend {
+        "nvml" | "smi" => "CUDA_VISIBLE_DEVICES=",
+        "xpu" => "ZE_AFFINITY_MASK=",
+        _ => return Vec::new(),
+    };
+    let mask = env
+        .split('\0')
+        .filter(|kv| kv.starts_with(key))
+        .collect::<Vec<_>>()
+        .join("\0");
+    parse_gpu_affinity(&mask)
+        .into_iter()
+        .filter_map(|local| {
+            inventory
+                .iter()
+                .find(|g| g.local_index == local)
+                .map(|g| g.index)
+        })
+        .collect()
 }
 
 /// Device indices from a NUL-separated environ block. Both variables are
@@ -1240,6 +1301,31 @@ fn cmdline_of(p: &sysinfo::Process) -> Option<String> {
     (!args.is_empty()).then(|| args.join(" "))
 }
 
+fn add_gpu_app(model: &mut DetectedModel, app: &ComputeApp) {
+    if !model.gpu_indices.contains(&app.gpu_index) {
+        model.gpu_indices.push(app.gpu_index);
+    }
+    model.mem_used_mb = model.mem_used_mb.saturating_add(app.mem_used_mb);
+}
+
+fn server_ancestor(
+    mut pid: u32,
+    is_server: impl Fn(u32) -> bool,
+    parent: impl Fn(u32) -> Option<u32>,
+) -> Option<u32> {
+    for _ in 0..32 {
+        let ppid = parent(pid)?;
+        if ppid == pid || ppid <= 1 {
+            return None;
+        }
+        if is_server(ppid) {
+            return Some(ppid);
+        }
+        pid = ppid;
+    }
+    None
+}
+
 struct ComputeApp {
     pid: u32,
     process_name: String,
@@ -1268,7 +1354,7 @@ fn gpu_uuid_index_map() -> std::collections::HashMap<String, u32> {
     map
 }
 
-fn nvidia_compute_apps() -> Vec<ComputeApp> {
+fn nvidia_compute_apps(inventory: &[GpuStats]) -> Vec<ComputeApp> {
     let uuid_map = gpu_uuid_index_map();
     let output = match std::process::Command::new("nvidia-smi")
         .args([
@@ -1281,8 +1367,20 @@ fn nvidia_compute_apps() -> Vec<ComputeApp> {
         _ => return Vec::new(),
     };
 
+    parse_nvidia_apps(
+        &String::from_utf8_lossy(&output.stdout),
+        &uuid_map,
+        inventory,
+    )
+}
+
+fn parse_nvidia_apps(
+    text: &str,
+    uuid_map: &std::collections::HashMap<String, u32>,
+    inventory: &[GpuStats],
+) -> Vec<ComputeApp> {
     let mut apps = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1299,7 +1397,18 @@ fn nvidia_compute_apps() -> Vec<ComputeApp> {
         let process_name = parts[2].trim().to_string();
         // Windows (WDDM) reports "[N/A]": keep the process, memory unknown.
         let mem_used = parts[3].trim().parse::<u64>().unwrap_or(0);
-        let gpu_index = uuid_map.get(uuid).copied().unwrap_or(0);
+        // An unknown UUID must not be silently assigned to GPU 0 (which
+        // could now be an AMD-only host after an NVIDIA driver failure).
+        let Some(&local_index) = uuid_map.get(uuid) else {
+            continue;
+        };
+        let Some(gpu_index) = inventory
+            .iter()
+            .find(|g| matches!(g.backend, "nvml" | "smi") && g.local_index == local_index)
+            .map(|g| g.index)
+        else {
+            continue;
+        };
         apps.push(ComputeApp {
             pid,
             process_name,
@@ -1326,78 +1435,92 @@ fn parse_amd_fdinfo(text: &str) -> Option<AmdClient> {
     if value("drm-driver:")? != "amdgpu" {
         return None;
     }
-    let mem_used_kib = value("drm-memory-vram:")?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
+    let mem_used_kib = value("drm-memory-vram:")
+        .or_else(|| value("drm-total-vram:"))
+        .and_then(parse_drm_memory_kib)
+        .unwrap_or(0);
     Some(AmdClient {
-        pdev: value("drm-pdev:")?.to_string(),
-        client_id: value("drm-client-id:")?.to_string(),
+        pdev: value("drm-pdev:").unwrap_or_default().to_string(),
+        client_id: value("drm-client-id:").unwrap_or("unknown").to_string(),
         mem_used_kib,
     })
 }
 
+fn parse_drm_memory_kib(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let n = parts.next()?.parse::<u64>().ok()?;
+    match parts.next().unwrap_or("KiB") {
+        "KiB" | "kB" => Some(n),
+        "MiB" => n.checked_mul(1024),
+        "GiB" => n.checked_mul(1024 * 1024),
+        "B" | "bytes" => Some(n / 1024),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn amd_compute_apps() -> Vec<ComputeApp> {
+fn amd_compute_apps(inventory: &[GpuStats]) -> Vec<ComputeApp> {
+    amd_compute_apps_at(inventory, Path::new("/proc"), Path::new("/sys"))
+}
+
+#[cfg(target_os = "linux")]
+fn amd_compute_apps_at(
+    inventory: &[GpuStats],
+    proc_root: &Path,
+    sys_root: &Path,
+) -> Vec<ComputeApp> {
     use std::collections::HashMap;
 
-    let mut cards: Vec<(String, PathBuf)> = std::fs::read_dir("/sys/class/drm")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let suffix = name.to_str()?.strip_prefix("card")?.to_string();
-            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let device = entry.path().join("device");
-            let vendor = std::fs::read_to_string(device.join("vendor")).ok()?;
-            (vendor.trim() == "0x1002").then_some((suffix, device))
-        })
-        .collect();
-    cards.sort_by_key(|(card, _)| card.parse::<u32>().unwrap_or(u32::MAX));
-    let pdev_to_index: HashMap<String, u32> = cards
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (_, device))| {
-            let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
-            let pdev = uevent
-                .lines()
-                .find_map(|line| line.strip_prefix("PCI_SLOT_NAME="))?;
-            Some((pdev.to_string(), index as u32))
-        })
+    let pdev_to_index: HashMap<String, u32> = inventory
+        .iter()
+        .filter(|g| g.backend == "amd")
+        .filter_map(|g| Some((g.pci_address.clone()?, g.index)))
         .collect();
     if pdev_to_index.is_empty() {
         return Vec::new();
     }
 
     let mut clients: HashMap<(u32, u32, String), u64> = HashMap::new();
-    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+    let Ok(proc_dir) = std::fs::read_dir(proc_root) else {
         return Vec::new();
     };
     for process in proc_dir.flatten() {
         let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let Ok(fdinfo) = std::fs::read_dir(process.path().join("fdinfo")) else {
-            continue;
-        };
-        for fd in fdinfo.flatten() {
-            let Ok(text) = std::fs::read_to_string(fd.path()) else {
+        // Scan both: fdinfo may be unavailable on an older driver, but the
+        // open render node still establishes placement (memory unknown).
+        let mut fds: Vec<_> = ["fd", "fdinfo"]
+            .into_iter()
+            .flat_map(|dir| {
+                std::fs::read_dir(process.path().join(dir))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .map(|fd| fd.file_name())
+            .collect();
+        fds.sort();
+        fds.dedup();
+        for fd in fds {
+            let client = std::fs::read_to_string(process.path().join("fdinfo").join(&fd))
+                .ok()
+                .and_then(|text| parse_amd_fdinfo(&text));
+            let pdev = client
+                .as_ref()
+                .filter(|c| !c.pdev.is_empty())
+                .map(|c| c.pdev.clone())
+                .or_else(|| render_node_pci(&process.path(), &fd, sys_root));
+            let Some(gpu_index) = pdev.as_ref().and_then(|p| pdev_to_index.get(p)).copied() else {
                 continue;
             };
-            let Some(client) = parse_amd_fdinfo(&text) else {
-                continue;
-            };
-            let Some(&gpu_index) = pdev_to_index.get(&client.pdev) else {
-                continue;
-            };
+            let (id, mem) = client
+                .map(|c| (c.client_id, c.mem_used_kib))
+                .unwrap_or_else(|| ("unknown".into(), 0));
             clients
-                .entry((pid, gpu_index, client.client_id))
-                .and_modify(|mem| *mem = (*mem).max(client.mem_used_kib))
-                .or_insert(client.mem_used_kib);
+                .entry((pid, gpu_index, id))
+                .and_modify(|old| *old = (*old).max(mem))
+                .or_insert(mem);
         }
     }
 
@@ -1409,7 +1532,7 @@ fn amd_compute_apps() -> Vec<ComputeApp> {
         .into_iter()
         .map(|((pid, gpu_index), mem_kib)| ComputeApp {
             pid,
-            process_name: std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            process_name: std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
@@ -1419,8 +1542,38 @@ fn amd_compute_apps() -> Vec<ComputeApp> {
         .collect()
 }
 
+/// Use the device number when possible: containers can rename /dev/dri
+/// nodes. /proc/<pid>/root reanchors absolute links in their mount namespace.
+#[cfg(target_os = "linux")]
+fn render_node_pci(process: &Path, fd: &std::ffi::OsStr, sys_root: &Path) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let fd_path = process.join("fd").join(fd);
+    let target = std::fs::read_link(&fd_path).ok()?;
+    let rooted = process
+        .join("root")
+        .join(target.strip_prefix("/").unwrap_or(&target));
+    if let Ok(meta) = std::fs::metadata(&fd_path).or_else(|_| std::fs::metadata(rooted)) {
+        if meta.file_type().is_char_device() {
+            let dev = meta.rdev();
+            let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
+            let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
+            if let Some(pci) =
+                crate::gpu::pci_address(&sys_root.join(format!("dev/char/{major}:{minor}/device")))
+            {
+                return Some(pci);
+            }
+        }
+    }
+    let node = target.file_name()?.to_str()?;
+    let suffix = node.strip_prefix("renderD")?;
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    crate::gpu::pci_address(&sys_root.join("class/drm").join(node).join("device"))
+}
+
 #[cfg(not(target_os = "linux"))]
-fn amd_compute_apps() -> Vec<ComputeApp> {
+fn amd_compute_apps(_inventory: &[GpuStats]) -> Vec<ComputeApp> {
     Vec::new()
 }
 
@@ -1873,6 +2026,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn affinity_masks_do_not_claim_another_vendor() {
+        let nvidia = GpuStats {
+            index: 2,
+            local_index: 2,
+            backend: "nvml",
+            ..Default::default()
+        };
+        let intel = GpuStats {
+            index: 3,
+            local_index: 3,
+            backend: "xpu",
+            ..Default::default()
+        };
+        let amd = GpuStats {
+            index: 0,
+            backend: "amd",
+            ..Default::default()
+        };
+        let env = "CUDA_VISIBLE_DEVICES=2\0ZE_AFFINITY_MASK=3.0\0";
+        assert_eq!(
+            resolve_gpu_affinity(env, std::slice::from_ref(&nvidia)),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_gpu_affinity(env, std::slice::from_ref(&intel)),
+            vec![3]
+        );
+        assert!(resolve_gpu_affinity(env, std::slice::from_ref(&amd)).is_empty());
+        assert!(resolve_gpu_affinity(env, &[nvidia, amd]).is_empty());
+        assert!(resolve_gpu_affinity(
+            env,
+            &[GpuStats {
+                mixed_host: true,
+                ..intel
+            }]
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn gpu_affinity_from_environ() {
         let env = "PATH=/bin\0ZE_AFFINITY_MASK=2.0,3\0CUDA_VISIBLE_DEVICES=GPU-ab12,3\0";
         assert_eq!(parse_gpu_affinity(env), vec![2, 3]);
@@ -1939,6 +2132,131 @@ mod tests {
         assert!(p.tensor_split.is_empty());
         let p = parse_cmdline("llama-server", "llama-server -m m.gguf --tensor-split 0,0");
         assert!(p.tensor_split.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mixed_host_render_nodes_memory_and_container_roots() {
+        use std::os::unix::fs::symlink;
+        let host = crate::test_support::MixedHost::new();
+        let inventory = vec![
+            GpuStats {
+                index: 0,
+                local_index: 0,
+                backend: "nvml",
+                ..Default::default()
+            },
+            GpuStats {
+                index: 1,
+                local_index: 0,
+                backend: "amd",
+                pci_address: Some("0000:43:00.0".into()),
+                ..Default::default()
+            },
+        ];
+        let fdinfo = include_str!("../fixtures/mixed-gpu/amdgpu-fdinfo.txt");
+        for (pid, node, info) in [
+            (111, "renderD129", Some(fdinfo)),
+            (112, "renderD128", None), // NVIDIA is not an AMD client
+            (113, "renderD129", None), // older driver, placement without memory
+            (114, "renderD129", Some(fdinfo)),
+            (
+                115,
+                "renderD129",
+                Some("drm-driver: amdgpu\ndrm-client-id: 42\ndrm-memory-vram: 16 MiB\n"),
+            ),
+        ] {
+            host.write(format!("proc/{pid}/comm"), "llama-server\n");
+            host.write(format!("proc/{pid}/fd/7"), "");
+            std::fs::remove_file(host.root.join(format!("proc/{pid}/fd/7"))).unwrap();
+            symlink(
+                format!("/dev/dri/{node}"),
+                host.root.join(format!("proc/{pid}/fd/7")),
+            )
+            .unwrap();
+            if let Some(info) = info {
+                host.write(format!("proc/{pid}/fdinfo/7"), info);
+            }
+        }
+        // dup() of the same DRM client is not a second VRAM allocation.
+        host.write("proc/114/fdinfo/8", fdinfo);
+        // A second client is added, not deduplicated against the first.
+        host.write("proc/115/fdinfo/8", fdinfo);
+        // Renamed device in a container: resolve through /proc/<pid>/root,
+        // then its device number, not the container's node basename.
+        host.write("proc/117/comm", "llama-server\n");
+        std::fs::create_dir_all(host.root.join("proc/117/root/dev")).unwrap();
+        std::fs::create_dir_all(host.root.join("proc/117/fd")).unwrap();
+        symlink(
+            "/dev/null",
+            host.root.join("proc/117/root/dev/container-amd"),
+        )
+        .unwrap();
+        symlink("/dev/container-amd", host.root.join("proc/117/fd/7")).unwrap();
+        host.write(
+            "sys/dev/char/1:3/device/uevent",
+            "PCI_SLOT_NAME=0000:43:00.0\n",
+        );
+        let mut apps =
+            amd_compute_apps_at(&inventory, &host.root.join("proc"), &host.root.join("sys"));
+        apps.sort_by_key(|a| a.pid);
+        assert_eq!(
+            apps.iter()
+                .map(|a| (a.pid, a.gpu_index, a.mem_used_mb))
+                .collect::<Vec<_>>(),
+            vec![
+                (111, 1, 14_847),
+                (113, 1, 0),
+                (114, 1, 14_847),
+                (115, 1, 14_863),
+                (117, 1, 0)
+            ]
+        );
+        // NVIDIA and AMD process records coexist, with disjoint indices.
+        let uuids = std::collections::HashMap::from([("GPU-3090".into(), 0)]);
+        let mut nvidia = parse_nvidia_apps(
+            "GPU-3090, 112, strata, 9000\nUNKNOWN, 999, ignored, 99\n",
+            &uuids,
+            &inventory,
+        );
+        assert_eq!(nvidia.len(), 1);
+        assert_eq!(nvidia[0].gpu_index, 0);
+        nvidia.extend(apps);
+        assert_eq!(nvidia.len(), 6);
+        // AMD-only uses local ordinal 0, never an NVIDIA offset guessed anew.
+        let mut amd_only = inventory[1].clone();
+        amd_only.index = 0;
+        let apps =
+            amd_compute_apps_at(&[amd_only], &host.root.join("proc"), &host.root.join("sys"));
+        assert!(apps.iter().all(|a| a.gpu_index == 0));
+    }
+
+    #[test]
+    fn worker_placement_folds_to_host_visible_server() {
+        let parent = |pid| match pid {
+            300 => Some(200),
+            200 => Some(100),
+            _ => None,
+        };
+        assert_eq!(server_ancestor(300, |pid| pid == 100, parent), Some(100));
+        assert_eq!(server_ancestor(300, |pid| pid == 999, parent), None);
+        assert_eq!(server_ancestor(300, |_| false, Some), None);
+        let mut model = crate::demo::demo_models(8192, 1).remove(0);
+        model.gpu_indices.clear();
+        model.mem_used_mb = 0;
+        for (index, mb) in [(0, 9_000), (1, 16_000), (1, 1_000)] {
+            add_gpu_app(
+                &mut model,
+                &ComputeApp {
+                    pid: 300,
+                    process_name: "worker".into(),
+                    gpu_index: index,
+                    mem_used_mb: mb,
+                },
+            );
+        }
+        assert_eq!(model.gpu_indices, vec![0, 1]);
+        assert_eq!(model.mem_used_mb, 26_000);
     }
 
     #[test]
@@ -2088,14 +2406,15 @@ mod tests {
     #[test]
     #[ignore = "live check: run on a host with real servers, e.g. docker run --pid:host"]
     fn detects_live_servers() {
-        let models = detect_models();
+        let inventory = crate::gpu::GpuBackend::detect(crate::nvml::NvmlSession::new()).inventory();
+        let models = detect_models(&inventory);
         for m in &models {
             eprintln!(
-                "detected: pid={} comm={} engine={} name={:?} port={:?} layers={} heads={} experts={}/{} path={:?} cmdline={}",
-                m.pid, m.process_name, m.engine, m.name, m.port,
-                m.n_layers(), m.n_heads(), m.n_experts_used(), m.n_experts(),
-                m.path.as_ref().map(|p| p.display().to_string()),
-                m.cmdline.chars().take(120).collect::<String>()
+                "detected: {m} layers={} heads={} experts={}/{}",
+                m.n_layers(),
+                m.n_heads(),
+                m.n_experts_used(),
+                m.n_experts()
             );
         }
         assert!(

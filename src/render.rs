@@ -66,7 +66,7 @@ pub struct Dashboard<'a> {
     pub demo: bool,
     /// Real routing from the patched server, when available.
     pub experts: Option<&'a ExpertStats>,
-    /// GPU telemetry backend: "nvml", "smi", "xpu", "amd", or "demo".
+    /// GPU telemetry backends: "nvml", "smi", "xpu", "amd", combinations, or "demo".
     pub gpu_backend: Option<&'a str>,
     /// The settings screen, drawn over the view while it is open.
     pub settings: Option<&'a SettingsForm>,
@@ -75,6 +75,15 @@ pub struct Dashboard<'a> {
     /// The context-speed screen (`c`): per-model buckets or why not, and
     /// which model is shown.
     pub ctx_speed: Option<(&'a Result<Vec<ContextSpeed>, String>, usize)>,
+}
+
+impl Dashboard<'_> {
+    fn serving_gpus(&self) -> impl Iterator<Item = &GpuStats> {
+        self.gpus.iter().filter(|g| {
+            self.detected
+                .is_some_and(|m| m.uses_gpu(g.index, self.gpus))
+        })
+    }
 }
 
 pub struct Renderer {
@@ -708,6 +717,18 @@ impl Renderer {
     }
 
     fn render_gpu_card(&self, frame: &mut Frame, area: Rect, g: &GpuStats, d: &Dashboard) {
+        if let Some(error) = &g.telemetry_error {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "G{} {} · unavailable: {}",
+                    g.index,
+                    g.short_name(),
+                    error
+                )),
+                area,
+            );
+            return;
+        }
         let w = area.width as usize;
         let gi = g.index as usize;
         let util = d
@@ -788,7 +809,7 @@ impl Renderer {
         // gpu_indices): white for its cards, grey for everyone else's.
         let affinity = d
             .detected
-            .map(|m| m.gpu_indices.is_empty() || m.gpu_indices.contains(&g.index))
+            .map(|m| m.uses_gpu(g.index, d.gpus))
             .unwrap_or(true);
         let name_style = if affinity {
             Style::default()
@@ -1438,8 +1459,14 @@ impl Renderer {
         let model_gpu_count = d
             .detected
             .map(|m| {
-                if m.gpu_indices.is_empty() {
-                    d.gpus.len().max(1)
+                if m.n_gpu_layers == Some(0) {
+                    0
+                } else if m.gpu_indices.is_empty() {
+                    if crate::gpu::is_mixed(d.gpus) {
+                        0
+                    } else {
+                        d.gpus.len().max(1)
+                    }
                 } else {
                     m.gpu_indices.len()
                 }
@@ -1541,6 +1568,9 @@ impl Renderer {
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 
+    // This grid is reduced along different axes; explicit coordinates keep
+    // the layer/head/token projections readable.
+    #[allow(clippy::needless_range_loop)]
     fn render_attention_heatmap(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let block = panel(" ◆ ATTENTION  layer × token ", pal::BLUE);
         let inner = block.inner(area);
@@ -1586,8 +1616,8 @@ impl Renderer {
             }
         } else {
             let rows = max_rows.max(1);
-            let per_row = (layers + rows - 1) / rows;
-            let vis_rows = (layers + per_row - 1) / per_row;
+            let per_row = layers.div_ceil(rows);
+            let vis_rows = layers.div_ceil(per_row);
             for vis in 0..vis_rows {
                 let l0 = vis * per_row;
                 let l1 = (l0 + per_row).min(layers);
@@ -1645,7 +1675,7 @@ impl Renderer {
             let txt = if d.generated.is_empty() {
                 "generated text will stream here".to_string()
             } else {
-                d.generated.to_string()
+                d.generated.text()
             };
             frame.render_widget(
                 Paragraph::new(txt)
@@ -1664,17 +1694,17 @@ impl Renderer {
         let label_w = 4usize;
         let cols = w.saturating_sub(label_w).max(1);
         // Horizontal: one block per expert when it fits, else `per_block` experts share a block.
-        let per_block = (n_e + cols - 1) / cols;
-        let n_blocks = (n_e + per_block - 1) / per_block;
+        let per_block = n_e.div_ceil(cols);
+        let n_blocks = n_e.div_ceil(per_block);
         let bw = (cols / n_blocks.max(1)).clamp(1, 4);
         let gap = usize::from(bw >= 2 && (bw + 1) * n_blocks <= cols);
         // Vertical: one layer per row, or two per row with half blocks, or grouped.
         let (layers_per_slot, half) = if n_l <= h {
             (1, false)
         } else {
-            (((n_l + 2 * h - 1) / (2 * h)).max(1), true)
+            (n_l.div_ceil(2 * h).max(1), true)
         };
-        let n_slots = (n_l + layers_per_slot - 1) / layers_per_slot;
+        let n_slots = n_l.div_ceil(layers_per_slot);
         let title = if !is_moe {
             " ◆ EXPERTS  dense model ".to_string()
         } else {
@@ -1758,7 +1788,7 @@ impl Renderer {
         };
         let gap_style = Style::default().bg(pal::c(pal::chrome().bg));
         let mut lines: Vec<Line> = Vec::with_capacity(h);
-        let text_rows = if half { (n_slots + 1) / 2 } else { n_slots };
+        let text_rows = if half { n_slots.div_ceil(2) } else { n_slots };
         for r in 0..text_rows.min(h) {
             let top = if half { r * 2 } else { r };
             let bot = top + 1;
@@ -1893,11 +1923,7 @@ impl Renderer {
         } else {
             Span::styled(" ○ ", Style::default().fg(pal::c(pal::TEXT_MUTED)))
         };
-        let dec = if live {
-            r.avg_decode_tps()
-        } else {
-            r.avg_decode_tps()
-        };
+        let dec = r.avg_decode_tps();
         let dec_col = if dec <= 0.0 {
             pal::c(pal::TEXT_MUTED)
         } else {
@@ -3071,7 +3097,7 @@ impl Renderer {
         let mut channels = Vec::new();
         let mut facts = Vec::new();
         let mut total_rx = 0.0f32;
-        for g in d.gpus {
+        for g in d.serving_gpus() {
             let i = g.index as usize;
             if let Some(m) = bw.pcie_rx.get(i) {
                 total_rx += m.value;
@@ -3114,7 +3140,7 @@ impl Renderer {
         // ---- VRAM ---------------------------------------------------------
         let mut channels = Vec::new();
         let mut busiest = 0.0f32;
-        for g in d.gpus {
+        for g in d.serving_gpus() {
             let i = g.index as usize;
             if let Some(m) = bw.vram_busy.get(i) {
                 busiest = busiest.max(m.value);
@@ -3241,7 +3267,8 @@ impl Renderer {
             return;
         }
         let stages = self.pipeline_stages(d);
-        let verdict = bandwidth::assess(d.perf, d.gpus);
+        let serving_gpus: Vec<_> = d.serving_gpus().cloned().collect();
+        let verdict = bandwidth::assess(d.perf, &serving_gpus);
         let n = stages.len();
         let w = inner.width as usize;
         let gutter = if w >= n * 18 + (n - 1) * 3 {
@@ -3352,7 +3379,7 @@ impl Renderer {
             ),
         ];
         let reading_w: usize = spans.iter().map(|x| x.content.chars().count()).sum();
-        if !st.tag.is_empty() && reading_w + st.tag.len() + 1 <= w {
+        if !st.tag.is_empty() && reading_w + st.tag.len() < w {
             spans.push(Span::styled(
                 format!(" {}", st.tag),
                 Style::default()
@@ -3475,7 +3502,8 @@ impl Renderer {
     }
 
     fn render_verdict(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
-        let v = bandwidth::assess(d.perf, d.gpus);
+        let serving_gpus: Vec<_> = d.serving_gpus().cloned().collect();
+        let v = bandwidth::assess(d.perf, &serving_gpus);
         let accent = match v.stage {
             Some(StageId::Disk) => pal::AMBER,
             Some(StageId::Ram) => pal::VIOLET,
@@ -3804,15 +3832,15 @@ fn sparkline(
             values[start + x - pad]
         };
         if v.is_nan() {
-            for r in 0..rows {
-                out[r].push(Span::raw(" "));
+            for row in &mut out {
+                row.push(Span::raw(" "));
             }
             continue;
         }
         let level = (v / max).clamp(0.0, 1.0);
         let col = pal::gradient_color(grad, level);
         let total = (level * rows as f32 * 8.0).round() as usize;
-        for r in 0..rows {
+        for (r, row) in out.iter_mut().enumerate() {
             let from_bottom = rows - 1 - r;
             let e = total.saturating_sub(from_bottom * 8).min(8);
             let span = if e == 0 {
@@ -3825,7 +3853,7 @@ fn sparkline(
                 let ch = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"][e];
                 Span::styled(ch, Style::default().fg(col))
             };
-            out[r].push(span);
+            row.push(span);
         }
     }
     out
@@ -3962,7 +3990,7 @@ pub fn fmt_int(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -4077,14 +4105,14 @@ fn quant_from_path(m: &DetectedModel) -> Option<String> {
     let is_quant = |t: &str| {
         let u = t.to_uppercase();
         let q = u.strip_prefix('I').unwrap_or(&u);
-        (q.starts_with('Q') && q.chars().nth(1).map_or(false, |c| c.is_ascii_digit()))
+        (q.starts_with('Q') && q.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
             || u == "F16"
             || u == "BF16"
             || u == "F32"
     };
     // Tokens are separated by '-' or '.', so "Q3_K_XL" stays intact.
     let mut pos = 0usize;
-    for tok in stem.split(|c| c == '-' || c == '.') {
+    for tok in stem.split(['-', '.']) {
         if !tok.is_empty() && is_quant(tok.split('_').next().unwrap_or(tok)) {
             let tag: String = stem[pos..pos + tok.len()]
                 .chars()
@@ -4095,6 +4123,22 @@ fn quant_from_path(m: &DetectedModel) -> Option<String> {
         pos += tok.len() + 1;
     }
     None
+}
+
+/// 320_001_536 → "320M", 20_000_003 → "20.0M", 4096 → "4.1K".
+fn fmt_count(n: u64) -> String {
+    let f = n as f64;
+    if f >= 1e9 {
+        format!("{:.1}B", f / 1e9)
+    } else if f >= 100e6 {
+        format!("{:.0}M", f / 1e6)
+    } else if f >= 1e6 {
+        format!("{:.1}M", f / 1e6)
+    } else if f >= 1e3 {
+        format!("{:.1}K", f / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -4232,25 +4276,133 @@ mod tests {
     }
 
     #[test]
+    fn mixed_gpu_panels_render_in_both_sizes_and_zoom_views() {
+        use ratatui::backend::TestBackend;
+        let mut model = crate::demo::demo_models(4096, 1).remove(0);
+        model.gpu_indices = vec![1];
+        let gpus = vec![
+            GpuStats {
+                index: 0,
+                backend: "nvml",
+                name: "NVIDIA GeForce RTX 3090".into(),
+                mem_total_mb: 24_576,
+                mem_used_mb: 9_000,
+                utilization_gpu: 39.0,
+                ..Default::default()
+            },
+            GpuStats {
+                index: 1,
+                backend: "amd",
+                name: "AMD Radeon RX 7900 XTX".into(),
+                mem_total_mb: 24_576,
+                mem_used_mb: 16_384,
+                utilization_gpu: 72.0,
+                ..Default::default()
+            },
+        ];
+        let fade = FadeState::new();
+        let perf = PerfTracker::new();
+        let live = LiveStats::default();
+        let attention = TokenBuffer::new(80);
+        let generated = GeneratedText::new();
+        let models = [ModelView {
+            detected: &model,
+            perf: &perf,
+            live: &live,
+            fade: &fade,
+            experts: None,
+            num_layers: 41,
+            num_heads: 32,
+        }];
+        let mut d = Dashboard {
+            models: &models,
+            focus: 0,
+            detected: Some(&model),
+            gpus: &gpus,
+            gpu_error: None,
+            fade: &fade,
+            perf: &perf,
+            live: &live,
+            attention: &attention,
+            generated: &generated,
+            num_layers: 41,
+            num_heads: 32,
+            view: ViewMode::All,
+            status: "fixture",
+            theme_name: "defrag",
+            demo: false,
+            experts: None,
+            gpu_backend: Some("nvml+amd"),
+            settings: None,
+            log: None,
+            ctx_speed: None,
+        };
+        let renderer = Renderer::new(pal::get_theme("defrag"), 0, 0, 4);
+        for (width, height) in [(150, 46), (100, 30)] {
+            for view in [
+                ViewMode::All,
+                ViewMode::Perf,
+                ViewMode::Models,
+                ViewMode::MoE,
+            ] {
+                d.view = view;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| renderer.render_view(f, f.area(), &d))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                if matches!(view, ViewMode::All | ViewMode::Perf) {
+                    assert!(text.contains("nvml+amd"), "{width}x{height}: {text}");
+                    assert!(text.contains("G0 RTX 3090"), "{text}");
+                    assert!(text.contains("G1 Radeon"), "{text}");
+                }
+            }
+        }
+        let mut unavailable = gpus.clone();
+        unavailable[1].telemetry_error = Some("amdgpu telemetry unreadable".into());
+        d.gpus = &unavailable;
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|f| renderer.render_gpus(f, f.area(), &d))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("unavailable: amdgpu telemetry unreadable"));
+        assert!(text.contains("G0 RTX 3090"));
+        // Single-vendor rendering does not depend on the new identity metadata.
+        let mut single = gpus[..1].to_vec();
+        single[0].backend = "";
+        d.gpus = &single;
+        d.gpu_backend = Some("nvml");
+        terminal
+            .draw(|f| renderer.render_gpus(f, f.area(), &d))
+            .unwrap();
+        let before = terminal.backend().buffer().clone();
+        let mut decorated = single.clone();
+        decorated[0].backend = "nvml";
+        decorated[0].pci_address = Some("0000:01:00.0".into());
+        d.gpus = &decorated;
+        terminal
+            .draw(|f| renderer.render_gpus(f, f.area(), &d))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer(), &before);
+    }
+
+    #[test]
     fn tile_size_fits_all_layers() {
         let (tw, th, tpr) = layer_tile_size(60, 10, 41);
         let tpc = 10 / th;
         assert!(tpr * tpc >= 41, "{tw}x{th} tpr {tpr}");
-    }
-}
-
-/// 320_001_536 → "320M", 20_000_003 → "20.0M", 4096 → "4.1K".
-fn fmt_count(n: u64) -> String {
-    let f = n as f64;
-    if f >= 1e9 {
-        format!("{:.1}B", f / 1e9)
-    } else if f >= 100e6 {
-        format!("{:.0}M", f / 1e6)
-    } else if f >= 1e6 {
-        format!("{:.1}M", f / 1e6)
-    } else if f >= 1e3 {
-        format!("{:.1}K", f / 1e3)
-    } else {
-        n.to_string()
     }
 }

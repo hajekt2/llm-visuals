@@ -1,0 +1,6 @@
+pos:	0
+flags:	0100002
+drm-driver:	amdgpu
+drm-client-id:	39
+drm-pdev:	0000:43:00.0
+drm-memory-vram:	15203992 KiB

@@ -622,8 +622,24 @@ the cause is visible.
 
 **AMD GPU panel is unavailable.** AMD telemetry requires Linux with the
 `amdgpu` driver and readable DRM sysfs/hwmon files under `/sys/class/drm`.
-No ROCm installation or privileged access is required. On other operating
+No ROCm installation or privileged access is required. Detected cards with
+unreadable telemetry remain visible as `unavailable`. On other operating
 systems the dashboard continues to use the existing NVIDIA collector.
+
+**Mixed NVIDIA / AMD / Intel hosts.** The panel collects all available vendors,
+with a combined backend label (for example `nvml+amd`). Dashboard GPU indices
+are allocated at startup: NVIDIA first (its existing indices), then AMD in
+DRM card-number order, then Intel. These indices stay fixed across telemetry
+failures and are the indices used by `--gpu`, models, and layer tiles.
+NVIDIA process memory comes from `nvidia-smi`; AMD placement comes from open
+DRM devices matched by PCI address and `/proc/<pid>/fdinfo` VRAM counters.
+Repeated descriptors of a DRM client are counted once. Without fdinfo memory,
+an open render node still establishes placement, but per-process memory is
+unknown. Container device links are resolved through `/proc/<pid>/root` and
+host-visible device numbers/PIDs. Reading another user's descriptors can need
+additional permissions. Unknown placement is not attributed to every vendor;
+visibility masks alone do not establish use on a mixed host (including Intel
+masks). Pure NVIDIA and Intel hosts retain their affinity-mask fallback.
 
 **MTP panel says "start llama-server with --metrics".** Exactly that; see
 above.

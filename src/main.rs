@@ -16,6 +16,8 @@ mod pipeline;
 mod render;
 mod settings;
 mod sglang;
+#[cfg(all(test, target_os = "linux"))]
+mod test_support;
 mod vision;
 mod vllm;
 
@@ -84,6 +86,20 @@ impl ModelSlot {
         }
     }
 
+    fn observe_host(&mut self, sample: &HostSample, inventory: &[GpuStats], now: Instant) {
+        let mut sample = sample.clone();
+        sample.pcie_mb_s.retain(|(index, _, _)| {
+            self.model.uses_gpu(*index, inventory)
+                && inventory
+                    .iter()
+                    .any(|g| g.index == *index && matches!(g.backend, "nvml" | "smi" | ""))
+        });
+        if sample.pcie_mb_s.is_empty() {
+            sample.pcie_ok = false;
+        }
+        self.perf.observe_host(&sample, now);
+    }
+
     fn view(&self) -> ModelView<'_> {
         ModelView {
             detected: &self.model,
@@ -105,7 +121,11 @@ fn auth_for(model: &DetectedModel, fallback: &HttpAuth) -> HttpAuth {
 /// The servers to watch: everything detected, minus anything the `--pid`
 /// filter excludes, capped at `--max-models`. Returns detected models and an
 /// optional error note if an explicitly requested endpoint failed.
-async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
+async fn discover(
+    args: &Args,
+    auth: &HttpAuth,
+    inventory: &[GpuStats],
+) -> (Vec<DetectedModel>, Option<String>) {
     let filter = args.pid_filter();
     let mut explicit_models = Vec::new();
     let mut explicit_error = None;
@@ -130,7 +150,7 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     }
 
     // 2. Scan processes for running LLM servers
-    let mut proc_models = model_detect::detect_models();
+    let mut proc_models = model_detect::detect_models(inventory);
 
     // 3. If no models found by process scan and no explicit endpoint was configured,
     // probe local candidate endpoints (vLLM, llama.cpp, etc.)
@@ -502,10 +522,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut theme_name = args.theme.clone();
     let theme = colors::get_theme(&theme_name);
 
+    // Discovery and polling share one index space, fixed before any process scan.
+    let gpu_backend = (!args.demo).then(|| {
+        Arc::new(GpuBackend::detect(if args.no_nvml {
+            None
+        } else {
+            nvml::NvmlSession::new()
+        }))
+    });
+    let inventory = gpu_backend
+        .as_ref()
+        .map(|b| b.inventory())
+        .unwrap_or_default();
+    let nvml_host = gpu_backend.as_ref().and_then(|b| b.nvml());
+    let backend_name = gpu_backend
+        .as_ref()
+        .map(|b| b.name())
+        .unwrap_or_else(|| "demo".into());
+
     let (discovered, endpoint_err) = if args.demo {
         (demo::demo_models(DEMO_CTX, args.demo_models), None)
     } else {
-        discover(&args, &auth).await
+        discover(&args, &auth, &inventory).await
     };
     let mut slots: Vec<ModelSlot> = discovered.into_iter().map(ModelSlot::new).collect();
     let mut focus: usize = 0;
@@ -593,23 +631,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_filter = args.gpu_indices();
     let mut poll = Duration::from_millis(args.poll_ms.max(50));
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
-
-    let (gpu_backend, nvml_host, backend_name) = if args.demo {
-        (None, None, "demo")
-    } else {
-        let nvml = if args.no_nvml {
-            None
-        } else {
-            nvml::NvmlSession::new()
-        };
-        let backend = Arc::new(GpuBackend::detect(nvml));
-        let nvml_host = match backend.as_ref() {
-            GpuBackend::Nvml(session) => Some(session.clone()),
-            _ => None,
-        };
-        let name = backend.name();
-        (Some(backend), nvml_host, name)
-    };
 
     if args.demo {
         let n = if gpu_filter.is_empty() {
@@ -838,7 +859,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h.abort();
             }
             // Keep the counters of models that are still up.
-            let (found, rescan_err) = discover(&args, &auth).await;
+            let (found, rescan_err) = discover(&args, &auth, &inventory).await;
             let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
             for m in found {
                 match slots.iter().position(|s| s.model.key() == m.key()) {
@@ -905,7 +926,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gpu_updated {
             // The cards are shared, so every model sees the same samples.
             for slot in &mut slots {
-                slot.perf.observe_gpu(&latest_gpu, now);
+                let owned: Vec<_> = latest_gpu
+                    .iter()
+                    .filter(|g| slot.model.uses_gpu(g.index, &latest_gpu))
+                    .cloned()
+                    .collect();
+                slot.perf.observe_gpu(&owned, now);
             }
         }
         for slot in &mut slots {
@@ -939,10 +965,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui_changed = true;
             for (pid, h) in batch {
                 if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
-                    slot.perf.observe_host(&h, now);
+                    slot.observe_host(&h, &latest_gpu, now);
                 } else if pid == 0 {
                     for slot in &mut slots {
-                        slot.perf.observe_host(&h, now);
+                        slot.observe_host(&h, &latest_gpu, now);
                     }
                 }
             }
@@ -1055,7 +1081,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             detected: cur.map(|v| v.detected),
             gpus: &latest_gpu,
             gpu_error: gpu_error.as_deref(),
-            gpu_backend: Some(backend_name),
+            gpu_backend: Some(&backend_name),
             fade: cur.map(|v| v.fade).unwrap_or(&empty_fade),
             perf: cur.map(|v| v.perf).unwrap_or(&empty_perf),
             live: cur.map(|v| v.live).unwrap_or(&empty_live),
@@ -1145,7 +1171,11 @@ fn fade_sample_from_live(
     let layer_target: Vec<f32> = (0..n_layers)
         .map(|l| {
             let dev = layer_gpu[l];
-            let u = util.get(dev).copied().unwrap_or(0.0) / 100.0;
+            let u = if detected.is_some_and(|m| !m.uses_gpu(dev as u32, gpu)) {
+                0.0
+            } else {
+                util.get(dev).copied().unwrap_or(0.0) / 100.0
+            };
             if processing {
                 u.clamp(0.08, 1.0)
             } else {
@@ -1176,7 +1206,6 @@ fn fade_sample_from_live(
         })
         .or_else(|| detected.map(|d| d.mem_used_mb))
         .unwrap_or(0);
-    let split_sum: f32 = split.iter().copied().sum::<f32>().max(1.0);
     let mut weight_frac = vec![0.0f32; n_gpus];
     let mut kv_alloc_frac = vec![0.0f32; n_gpus];
     // Placement, not the weight estimate: a model whose size is unknown
@@ -1187,24 +1216,11 @@ fn fade_sample_from_live(
         if i >= n_gpus {
             continue;
         }
-        let share = if !split.is_empty() {
-            split.get(i).copied().unwrap_or(0.0) / split_sum
-        } else if let Some(idxs) =
-            detected.and_then(|d| (!d.gpu_indices.is_empty()).then_some(d.gpu_indices.as_slice()))
-        {
-            // Engine told us which GPUs it actually uses (e.g. one-GPU
-            // vLLM serve): spread evenly over those, zero elsewhere.
-            let own = idxs.iter().filter(|&&g| g as usize == i).count();
-            if own > 0 {
-                1.0 / idxs.len().max(1) as f32
-            } else {
-                0.0
-            }
-        } else {
-            // Unknown layout: assume it spans every visible GPU.
-            1.0 / gpu.len().max(1) as f32
-        };
+        let share = detected.map(|m| m.gpu_share(g.index, gpu)).unwrap_or(0.0);
         model_owned[i] = share > 0.0;
+        if share <= 0.0 {
+            continue;
+        }
         let used_f = if g.mem_total_mb == 0 {
             0.0
         } else {
@@ -1255,6 +1271,68 @@ mod tests {
     use clap::Parser;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
+        super::discover(args, auth, &[]).await
+    }
+
+    #[test]
+    fn mixed_host_weights_kv_and_layers_stay_on_the_serving_gpu() {
+        let mut model = demo::demo_models(8192, 1).remove(0);
+        model.gpu_indices = vec![1];
+        model.tensor_split = vec![1.0];
+        let gpus = vec![
+            GpuStats {
+                index: 0,
+                backend: "nvml",
+                mem_total_mb: 24_576,
+                mem_used_mb: 9_000,
+                utilization_gpu: 99.0,
+                ..Default::default()
+            },
+            GpuStats {
+                index: 1,
+                backend: "amd",
+                mem_total_mb: 24_576,
+                mem_used_mb: 16_384,
+                utilization_gpu: 10.0,
+                ..Default::default()
+            },
+        ];
+        let live = LiveStats {
+            processing: true,
+            weight_gb: Some(12.0),
+            kv_cache_gb: Some(4.0),
+            ..Default::default()
+        };
+        let sample = fade_sample_from_live(Some(&model), &gpus, &live, 8);
+        assert_eq!(sample.model_owned, vec![false, true]);
+        assert_eq!(sample.weight_frac, vec![0.0, 0.5]);
+        assert_eq!(sample.kv_alloc_frac[0], 0.0);
+        assert!(sample.kv_alloc_frac[1] > 0.0);
+        assert!(sample.layer_gpu.iter().all(|&g| g == 1));
+        assert!(sample.layer_target.iter().all(|&u| (u - 0.1).abs() < 0.001));
+        // No fd / process evidence: do not borrow the NVIDIA card's 99%.
+        model.gpu_indices.clear();
+        let sample = fade_sample_from_live(Some(&model), &gpus, &live, 8);
+        assert_eq!(sample.model_owned, vec![false, false]);
+        assert_eq!(sample.weight_frac, vec![0.0, 0.0]);
+        assert_eq!(sample.kv_alloc_frac, vec![0.0, 0.0]);
+        assert!(sample.layer_target.iter().all(|&u| u <= 0.08));
+        model.gpu_indices = vec![1];
+        let mut slot = ModelSlot::new(model);
+        slot.observe_host(
+            &HostSample {
+                pcie_mb_s: vec![(0, 500.0, 100.0)],
+                pcie_ok: true,
+                ..Default::default()
+            },
+            &gpus,
+            Instant::now(),
+        );
+        assert!(slot.perf.bw.host.pcie_mb_s.is_empty());
+        assert!(!slot.perf.bw.host.pcie_ok);
+    }
 
     #[test]
     fn dir_model_bytes_sums_weight_shards_only() {
