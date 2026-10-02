@@ -4415,6 +4415,7 @@ mod tests {
         let mut unknown_model = model.clone();
         unknown_model.gpu_indices.clear();
         let mut unknown_fade = FadeState::new();
+        unknown_fade.n_layers = 41;
         unknown_fade.layer_gpu = vec![crate::gpu::UNKNOWN_GPU; 41];
         d.detected = Some(&unknown_model);
         d.fade = &unknown_fade;
