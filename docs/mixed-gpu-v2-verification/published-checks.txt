@@ -1,0 +1,17 @@
+Verified 2026-10-02; downloaded GitHub assets, not local dist files
+
+llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz: OK
+3ac0884102be2bfd7dbe3887c18612cf88fc90c409968639f17b2cc3eaafea38  llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz
+1c8cc7ac662b41d622563d21c7bacd40b2f6e00032d22505ead7a7660f32a977  llm-visuals
+llm-visuals 0.10.0-hajek.2
+llm-visuals 0.10.0-hajek.2
+llm-visuals
+assets[2]{digest,name,size,url}:
+  "sha256:3ac0884102be2bfd7dbe3887c18612cf88fc90c409968639f17b2cc3eaafea38",llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz,2383764,"https://github.com/hajekt2/llm-visuals/releases/download/v0.10.0-hajek.2/llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz"
+  "sha256:7325c9fe14369f86964566cd39055851abdef2d5139b05795d3b14ba451a8a4c",llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz.sha256,113,"https://github.com/hajekt2/llm-visuals/releases/download/v0.10.0-hajek.2/llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz.sha256"
+draft: false
+prerelease: true
+tag: v0.10.0-hajek.2
+url: "https://github.com/hajekt2/llm-visuals/releases/tag/v0.10.0-hajek.2"
+9f50a8e70a2b6b1f3b0b89b2ddf5e321ae7745f1	refs/heads/fm/llm-visuals-mixed-gpu-v2
+9f50a8e70a2b6b1f3b0b89b2ddf5e321ae7745f1	refs/tags/v0.10.0-hajek.2

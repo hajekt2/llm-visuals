@@ -2,9 +2,9 @@
 
 ## v0.10.0-hajek.2: current release
 
-Prepared on 2026-10-02; publication and independent download verification are
-pending. Firstmate steering `001.msg` authorized publishing this follow-up to
-the owner's fork after ordinary-user live validation. No upstream contact or
+Published and independently download-verified on 2026-10-02. Firstmate steering
+`001.msg` authorized publishing this follow-up to the owner's fork after
+ordinary-user live validation. No upstream contact or
 publication, homelab deployment, service restart or configuration change is
 part of this worker's release.
 
@@ -13,7 +13,10 @@ part of this worker's release.
 - Tag: `v0.10.0-hajek.2`
 - Branch: `fm/llm-visuals-mixed-gpu-v2`
 - Source change: `c202e230cc906803ef9a24ba5d34b41eba790b0f`
-- Intended state: published prerelease, not the fork's latest stable release.
+- Tag target: `9f50a8e70a2b6b1f3b0b89b2ddf5e321ae7745f1`
+- State: published prerelease, not the fork's latest stable release.
+- Both branch and tag were pushed to remote `fork` without force; this receipt
+  subsequently advances the branch without moving the release tag.
 
 Asset URL:
 https://github.com/hajekt2/llm-visuals/releases/download/v0.10.0-hajek.2/llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz
@@ -58,7 +61,26 @@ PID/endpoint inferred and public-router configured paths were captured idle
 without any inference request. Full evidence and limitations are in
 [the report](mixed-gpu-report.md#v0100-hajek2-follow-up-ordinary-user-deployment-2026-10-02).
 
-### Exact new homelab pin after publication
+### Published-asset verification
+
+```sh
+gh-axi release download v0.10.0-hajek.2 --repo hajekt2/llm-visuals \
+  --pattern 'llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz*' \
+  --dir target/verification/published-v2
+(cd target/verification/published-v2 && \
+  sha256sum -c llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz.sha256)
+```
+
+Result: **OK**, from downloaded assets, not just the local package. GitHub's
+archive digest equals the pin above. Extracted binary SHA-256 equals the
+live-verified scratch executable; both downloaded `--version` and `-V` print
+the expected Cargo version. Archive listing confirms only the root executable.
+GitHub confirms `draft: false`, `prerelease: true`, and exactly the archive and
+checksum sidecar assets. Branch/tag readback confirms the stated tag target;
+no Actions runs were created by this fork-only publication. Evidence:
+[published checks](mixed-gpu-v2-verification/published-checks.txt).
+
+### Exact new homelab pin
 
 ```yaml
 ai_inference_llm_visuals_version: '0.10.0-hajek.2'

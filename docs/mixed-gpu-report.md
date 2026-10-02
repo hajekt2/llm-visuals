@@ -134,10 +134,14 @@ sent to Strata :8098.
 Final binary SHA-256 (matches the live scratch copy):
 `1c8cc7ac662b41d622563d21c7bacd40b2f6e00032d22505ead7a7660f32a977`.
 
-Prepared archive: `dist/llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz`, containing
+Published archive: `llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz`, containing
 only the root executable. Archive SHA-256:
 `3ac0884102be2bfd7dbe3887c18612cf88fc90c409968639f17b2cc3eaafea38`.
-Publication/download verification and exact homelab pin are in the release receipt.
+Published prerelease:
+https://github.com/hajekt2/llm-visuals/releases/tag/v0.10.0-hajek.2
+Independent download/checksum verification passed, including extracted-binary
+hash and both version flags. Exact homelab pin and publication receipt are in
+[mixed-gpu-release.md](mixed-gpu-release.md).
 
 ## Original hajek.1 root cause and source base
 
