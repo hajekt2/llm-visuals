@@ -325,7 +325,7 @@ impl GpuBackend {
         }
         // A broken NVIDIA driver must not make a physically mixed host
         // look AMD-only and let unknown NVIDIA servers borrow AMD usage.
-        if mixed_sysfs(Path::new("/sys/class/drm")) {
+        if mixed_sysfs(Path::new("/sys")) {
             for (_, stats) in &mut sources {
                 for g in stats {
                     g.mixed_host = true;
@@ -515,10 +515,25 @@ fn drm_device_paths(_root: &Path, _vendor: &str) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn mixed_sysfs(root: &Path) -> bool {
+fn mixed_sysfs(sys_root: &Path) -> bool {
+    // Compute-only NVIDIA setups need not expose a DRM card. PCI graphics
+    // functions still prove physical presence when the driver probe fails.
+    let pci_vendors: Vec<String> = std::fs::read_dir(sys_root.join("bus/pci/devices"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let device = entry.path();
+            read_trimmed(device.join("class")).filter(|class| class.starts_with("0x03"))?;
+            read_trimmed(device.join("vendor"))
+        })
+        .collect();
     ["0x10de", "0x1002", "0x8086"]
         .iter()
-        .filter(|vendor| !drm_device_paths(root, vendor).is_empty())
+        .filter(|vendor| {
+            !drm_device_paths(&sys_root.join("class/drm"), vendor).is_empty()
+                || pci_vendors.iter().any(|v| v.as_str() == **vendor)
+        })
         .count()
         > 1
 }
@@ -980,7 +995,7 @@ mod tests {
     fn startup_driver_failure_does_not_assign_amd_to_unknown_nvidia_servers() {
         let host = crate::test_support::MixedHost::new();
         let drm = host.root.join("sys/class/drm");
-        assert!(mixed_sysfs(&drm));
+        assert!(mixed_sysfs(&host.root.join("sys")));
         let amd = amd_devices_at(&drm);
         let mut stats = collect_amd(&amd).unwrap();
         // Only AMD telemetry succeeded, but sysfs still proves mixed hardware.
@@ -997,7 +1012,12 @@ mod tests {
         assert!(!unknown.uses_gpu(inventory[0].index, &inventory));
         assert_eq!(unknown.gpu_share(inventory[0].index, &inventory), 0.0);
         std::fs::remove_dir_all(drm.join("card0")).unwrap();
-        assert!(!mixed_sysfs(&drm));
+        assert!(!mixed_sysfs(&host.root.join("sys")));
+        host.write("sys/bus/pci/devices/0000:02:00.0/vendor", "0x10de\n");
+        host.write("sys/bus/pci/devices/0000:02:00.0/class", "0x030200\n");
+        assert!(mixed_sysfs(&host.root.join("sys"))); // NVIDIA without DRM
+        host.write("sys/bus/pci/devices/0000:02:00.0/class", "0x040300\n");
+        assert!(!mixed_sysfs(&host.root.join("sys"))); // audio is not a GPU
     }
 
     #[test]
