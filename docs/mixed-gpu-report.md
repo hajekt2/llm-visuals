@@ -1,9 +1,11 @@
 # Mixed-vendor GPU fix: verification and release handoff
 
-Verified on 2026-10-02. Delivery is **local-only**, on
-`fm/llm-visuals-mixed-gpu`. No push, release, upstream issue, or upstream pull
-request was made. Firstmate must publish the prepared assets before changing
-the installer pin.
+Verified on 2026-10-02. This report records the initial **local-only** handoff
+on `fm/llm-visuals-mixed-gpu`; the unpublished state below refers to that
+handoff. Subsequent firstmate steering authorized fork-only publication.
+See [the verified publication receipt](mixed-gpu-release.md) for the live
+release URL and deployable installer pin. No upstream issue or pull request
+was made.
 
 ## Root cause and source base
 
