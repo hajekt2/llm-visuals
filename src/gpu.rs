@@ -885,6 +885,78 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn swapped_drm_card_and_render_numbering_keeps_identical_attribution() {
+        use std::os::unix::fs::symlink;
+        let mut snapshots = Vec::new();
+        for swapped in [false, true] {
+            let host = crate::test_support::MixedHost::new();
+            let drm = host.root.join("sys/class/drm");
+            std::fs::rename(drm.join("card2"), drm.join("card1")).unwrap();
+            if swapped {
+                for (from, to) in [
+                    ("card0", "card-temp"),
+                    ("card1", "card0"),
+                    ("card-temp", "card1"),
+                    ("renderD128", "render-temp"),
+                    ("renderD129", "renderD128"),
+                    ("render-temp", "renderD129"),
+                ] {
+                    std::fs::rename(drm.join(from), drm.join(to)).unwrap();
+                }
+            }
+            host.write("proc/42/comm", "llama-server\n");
+            host.write("proc/42/fd/7", "");
+            std::fs::remove_file(host.root.join("proc/42/fd/7")).unwrap();
+            symlink(
+                if swapped {
+                    "/dev/dri/renderD128"
+                } else {
+                    "/dev/dri/renderD129"
+                },
+                host.root.join("proc/42/fd/7"),
+            )
+            .unwrap();
+            // Deliberately no drm-pdev: the render node must resolve via PCI,
+            // not its ordinal or the card number assigned in this boot.
+            host.write(
+                "proc/42/fdinfo/7",
+                "drm-driver: amdgpu\ndrm-client-id: 39\ndrm-memory-vram: 1048576 KiB\n",
+            );
+            let amd = amd_devices_at(&drm);
+            let stats = collect_amd(&amd).unwrap();
+            let nvidia = parse_csv(include_str!("../fixtures/mixed-gpu/nvidia-smi.csv"));
+            let backend = GpuBackend::from_sources(vec![
+                (GpuBackend::NvidiaSmi, nvidia),
+                (GpuBackend::Amd(amd), stats),
+            ]);
+            let inventory = backend.inventory();
+            let placement = crate::model_detect::fixture_amd_attribution(
+                &inventory,
+                &host.root.join("proc"),
+                &host.root.join("sys"),
+            );
+            assert_eq!(placement, vec![(42, 1, 1024)]);
+            snapshots.push((
+                inventory
+                    .iter()
+                    .map(|g| {
+                        (
+                            g.index,
+                            g.local_index,
+                            g.backend,
+                            g.pci_address.clone(),
+                            g.mem_used_mb,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                placement,
+            ));
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn single_vendor_names_and_indices_are_unchanged() {
         let host = crate::test_support::MixedHost::new();
         let devices = amd_devices_at(&host.root.join("sys/class/drm"));

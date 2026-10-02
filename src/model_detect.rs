@@ -1592,6 +1592,20 @@ fn amd_compute_apps_at(
         .collect()
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fixture_amd_attribution(
+    inventory: &[GpuStats],
+    proc_root: &Path,
+    sys_root: &Path,
+) -> Vec<(u32, u32, u64)> {
+    let mut apps: Vec<_> = amd_compute_apps_at(inventory, proc_root, sys_root)
+        .into_iter()
+        .map(|a| (a.pid, a.gpu_index, a.mem_used_mb))
+        .collect();
+    apps.sort_unstable();
+    apps
+}
+
 /// Use the device number when possible: containers can rename /dev/dri
 /// nodes. /proc/<pid>/root reanchors absolute links in their mount namespace.
 #[cfg(target_os = "linux")]
@@ -2497,7 +2511,8 @@ mod tests {
         let models = detect_models(&inventory);
         for m in &models {
             eprintln!(
-                "detected: {m} layers={} heads={} experts={}/{}",
+                "detected: {m} port={:?} layers={} heads={} experts={}/{}",
+                m.port,
                 m.n_layers(),
                 m.n_heads(),
                 m.n_experts_used(),
