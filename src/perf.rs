@@ -814,6 +814,16 @@ impl PerfTracker {
         }
         self.total_power_w = gpus.iter().map(|g| g.power_watts).sum();
         self.bw.ensure_gpu(n, gpus);
+        // A rescan can move a server to another card. Historical traces
+        // remain valid, but stale current counters must not bind its verdict
+        // to a device it no longer holds.
+        for (i, meter) in self.bw.vram_busy.iter_mut().enumerate() {
+            if !gpus.iter().any(|g| g.index as usize == i) {
+                meter.update(0.0, now, dt);
+                self.bw.pcie_rx[i].update(0.0, now, dt);
+                self.bw.pcie_tx[i] = 0.0;
+            }
+        }
         for g in gpus {
             let i = g.index as usize;
             self.bw.vram_busy[i].update(g.utilization_mem, now, dt);
@@ -1227,6 +1237,32 @@ mod tests {
             steps
         );
         assert!((p.bw.vram.value - 1.5 * steps).abs() < 1e-3);
+    }
+
+    #[test]
+    fn placement_changes_clear_unowned_current_counters() {
+        let now = Instant::now();
+        let mut p = PerfTracker::new();
+        p.observe_gpu(
+            &[GpuStats {
+                index: 0,
+                utilization_mem: 95.0,
+                ..Default::default()
+            }],
+            now,
+        );
+        p.bw.pcie_rx[0].update(1000.0, now, 0.2);
+        p.observe_gpu(
+            &[GpuStats {
+                index: 1,
+                utilization_mem: 20.0,
+                ..Default::default()
+            }],
+            now + Duration::from_millis(200),
+        );
+        assert_eq!(p.bw.vram_busy[0].value, 0.0);
+        assert_eq!(p.bw.pcie_rx[0].value, 0.0);
+        assert_eq!(p.bw.vram_busy[1].value, 20.0);
     }
 
     #[test]

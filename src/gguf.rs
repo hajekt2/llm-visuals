@@ -465,7 +465,12 @@ pub fn layer_device(layer: usize, n_layers: usize, split: &[f32], gpu_indices: &
     for (i, s) in split.iter().enumerate() {
         acc += *s;
         if t <= acc {
-            return gpu_indices.get(i).copied().map(|g| g as usize).unwrap_or(i);
+            return gpu_indices
+                .get(i)
+                .or_else(|| gpu_indices.last())
+                .copied()
+                .map(|g| g as usize)
+                .unwrap_or(i);
         }
     }
     gpu_indices
@@ -491,6 +496,15 @@ mod tests {
         assert_eq!(layer_device(0, 41, &split, &[]), 0);
         assert_eq!(layer_device(25, 41, &split, &[]), 0);
         assert_eq!(layer_device(40, 41, &split, &[]), 1);
+    }
+
+    #[test]
+    fn tensor_split_never_escapes_observed_global_indices() {
+        for layer in 0..64 {
+            assert!([4, 5].contains(&layer_device(layer, 64, &[1.0, 1.0, 1.0], &[4, 5])));
+        }
+        assert_eq!(layer_device(0, 64, &[1.0], &[1]), 1);
+        assert_eq!(layer_device(63, 64, &[0.0, 1.0], &[1]), 1);
     }
 
     #[test]
