@@ -320,11 +320,20 @@ impl GpuBackend {
                 sources.push((Self::Xpu, stats));
             }
         }
+        // A broken NVIDIA driver must not make a physically mixed host
+        // look AMD-only and let unknown NVIDIA servers borrow AMD usage.
+        if mixed_sysfs(Path::new("/sys/class/drm")) {
+            for (_, stats) in &mut sources {
+                for g in stats {
+                    g.mixed_host = true;
+                }
+            }
+        }
         Self::from_sources(sources)
     }
 
     fn from_sources(mut sources: Vec<(Self, Vec<GpuStats>)>) -> Self {
-        if sources.len() <= 1 {
+        if sources.len() <= 1 && !sources.iter().any(|(_, g)| g.iter().any(|g| g.mixed_host)) {
             // Keep single-vendor ordinals and backend names unchanged.
             return sources.pop().map(|(b, _)| b).unwrap_or(Self::NvidiaSmi);
         }
@@ -453,7 +462,7 @@ fn amd_devices() -> Vec<AmdDevice> {
 
 #[cfg(target_os = "linux")]
 fn amd_devices_at(root: &Path) -> Vec<AmdDevice> {
-    amd_device_paths(root)
+    drm_device_paths(root, "0x1002")
         .into_iter()
         .enumerate()
         .map(|(index, path)| AmdDevice {
@@ -470,7 +479,7 @@ fn amd_devices() -> Vec<AmdDevice> {
 }
 
 #[cfg(target_os = "linux")]
-fn amd_device_paths(root: &Path) -> Vec<PathBuf> {
+fn drm_device_paths(root: &Path, vendor: &str) -> Vec<PathBuf> {
     let mut devices: Vec<PathBuf> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
@@ -483,7 +492,7 @@ fn amd_device_paths(root: &Path) -> Vec<PathBuf> {
                 return None;
             }
             let device = entry.path().join("device");
-            (read_trimmed(device.join("vendor")).as_deref() == Some("0x1002")).then_some(device)
+            (read_trimmed(device.join("vendor")).as_deref() == Some(vendor)).then_some(device)
         })
         .collect();
     devices.sort_by_key(|path| {
@@ -499,8 +508,16 @@ fn amd_device_paths(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-fn amd_device_paths(_root: &Path) -> Vec<PathBuf> {
+fn drm_device_paths(_root: &Path, _vendor: &str) -> Vec<PathBuf> {
     Vec::new()
+}
+
+fn mixed_sysfs(root: &Path) -> bool {
+    ["0x10de", "0x1002", "0x8086"]
+        .iter()
+        .filter(|vendor| !drm_device_paths(root, vendor).is_empty())
+        .count()
+        > 1
 }
 
 #[cfg(target_os = "linux")]
@@ -953,6 +970,31 @@ mod tests {
             ));
         }
         assert_eq!(snapshots[0], snapshots[1]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn startup_driver_failure_does_not_assign_amd_to_unknown_nvidia_servers() {
+        let host = crate::test_support::MixedHost::new();
+        let drm = host.root.join("sys/class/drm");
+        assert!(mixed_sysfs(&drm));
+        let amd = amd_devices_at(&drm);
+        let mut stats = collect_amd(&amd).unwrap();
+        // Only AMD telemetry succeeded, but sysfs still proves mixed hardware.
+        for g in &mut stats {
+            g.mixed_host = true;
+        }
+        let backend = GpuBackend::from_sources(vec![(GpuBackend::Amd(amd), stats)]);
+        assert_eq!(backend.name(), "amd");
+        let inventory = backend.inventory();
+        assert_eq!(inventory.len(), 1);
+        assert!(is_mixed(&inventory));
+        let mut unknown = crate::demo::demo_models(8192, 1).remove(0);
+        unknown.gpu_indices.clear();
+        assert!(!unknown.uses_gpu(inventory[0].index, &inventory));
+        assert_eq!(unknown.gpu_share(inventory[0].index, &inventory), 0.0);
+        std::fs::remove_dir_all(drm.join("card0")).unwrap();
+        assert!(!mixed_sysfs(&drm));
     }
 
     #[test]
