@@ -1,0 +1,28 @@
+   Compiling llm-visuals v0.10.0-hajek.1 (/home/haja/work/.treehouse/llm-visuals-e9d109/1/llm-visuals)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.53s
+     Running unittests src/main.rs (target/debug/deps/llm_visuals-89dd487c38d12637)
+
+running 2 tests
+
+thread 'model_detect::tests::router_inherits_recognized_child_gpu_while_idle' (1824354) panicked at src/model_detect.rs:2400:9:
+assertion `left == right` failed
+  left: []
+ right: [1]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test model_detect::tests::router_inherits_recognized_child_gpu_while_idle ... FAILED
+
+thread 'model_detect::tests::router_inherits_container_child_render_node_without_fdinfo' (1824353) panicked at src/model_detect.rs:2411:9:
+assertion `left == right` failed
+  left: []
+ right: [1]
+test model_detect::tests::router_inherits_container_child_render_node_without_fdinfo ... FAILED
+
+failures:
+
+failures:
+    model_detect::tests::router_inherits_container_child_render_node_without_fdinfo
+    model_detect::tests::router_inherits_recognized_child_gpu_while_idle
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin llm-visuals`

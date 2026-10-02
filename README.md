@@ -633,13 +633,38 @@ DRM card-number order, then Intel. These indices stay fixed across telemetry
 failures and are the indices used by `--gpu`, models, and layer tiles.
 NVIDIA process memory comes from `nvidia-smi`; AMD placement comes from open
 DRM devices matched by PCI address and `/proc/<pid>/fdinfo` VRAM counters.
-Repeated descriptors of a DRM client are counted once. Without fdinfo memory,
-an open render node still establishes placement, but per-process memory is
-unknown. Container device links are resolved through `/proc/<pid>/root` and
-host-visible device numbers/PIDs. Reading another user's descriptors can need
-additional permissions. Unknown placement is not attributed to every vendor;
-visibility masks alone do not establish use on a mixed host (including Intel
-masks). Pure NVIDIA and Intel hosts retain their affinity-mask fallback.
+Evidence held by the server or any descendant establishes **direct** placement.
+Repeated descriptors and inherited copies of a DRM client are counted once per
+server. Without fdinfo memory, an open render node still establishes placement,
+but per-process memory is unknown. Container device links are resolved through
+`/proc/<pid>/root` and host-visible device numbers/PIDs.
+
+If `/proc/<pid>/fd` is permission denied, and exactly one unplaced server and
+one GPU with VRAM in use remain after excluding other attributed servers, the
+dashboard shows **inferred** placement with its reason. This is elimination,
+not proof of ownership: unrelated GPU applications can invalidate that
+assumption. Multiple candidate GPUs or unplaced servers remain **unknown**,
+with the exact permission-denied path and an access hint. No privilege escalation
+or permission change is attempted. Inferred process memory is `not measured`;
+GPU VRAM remains driver-measured and the weight/KV split remains estimated.
+
+For an authoritative owner-supplied override, use repeatable
+`--server-gpu PORT=SELECTOR`, where the selector is a unique vendor (`amd`,
+`nvidia`, `intel`) or a PCI address exposed by the inventory, such as
+`pci:0000:01:00.0`. A router's public-port mapping also covers its descendants:
+
+```sh
+llm-visuals --server-gpu 8080=pci:0000:01:00.0 --log-db off
+LLM_VISUALS_SERVER_GPU='8080=amd,8098=nvidia' llm-visuals --log-db off
+```
+
+CLI mappings override environment mappings for the same port. Overrides are
+visibly **configured**, not measured evidence; ambiguous selectors are rejected.
+Bare llama.cpp routers are hidden beside loaded children unless explicitly
+selected by PID/endpoint. Unknown placement never borrows every vendor's
+activity; visibility masks alone do not establish use on a mixed host (including
+Intel masks). Pure NVIDIA and Intel hosts retain their affinity-mask fallback.
+`llm-visuals --version` and `-V` print the Cargo package version.
 Strata servers are recognized from their process and `--ple-gguf` model source;
 only process/GPU telemetry is shown for them. No HTTP counter adapter is
 implemented for Strata, so the dashboard does not send it llama.cpp probes.

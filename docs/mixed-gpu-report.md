@@ -7,7 +7,139 @@ See [the verified publication receipt](mixed-gpu-release.md) for the live
 release URL and deployable installer pin. No upstream issue or pull request
 was made.
 
-## Root cause and source base
+## v0.10.0-hajek.2 follow-up: ordinary-user deployment (2026-10-02)
+
+Source change: `c202e230cc906803ef9a24ba5d34b41eba790b0f`, built from the
+hajek.1 branch, still a fast-forward from local default `main`. Firstmate
+steering `001.msg` authorized visible inferred/configured fallbacks and fork-only
+publication after the initial local-only brief. The original hajek.1 history
+below is retained; its unpublished installer values are historical, not the
+current release pin. See [release receipts](mixed-gpu-release.md).
+
+### Actual deployment root cause
+
+The installed hajek.1 executable rejects `--version`. Its clap command omitted
+`version`; `--version` and `-V` now print `llm-visuals 0.10.0-hajek.2` from Cargo.
+All existing flags retain their meaning; the new optional `--server-gpu` flag
+was explicitly requested by steering.
+
+Radeon attribution failed **because the owner runs as ordinary user `haja`**,
+not because RADV needs a busy request, fdinfo keys are absent, or DRM numbering
+cannot be mapped. [Read-only runtime evidence](mixed-gpu-v2-verification/runtime-before.txt)
+shows root-owned Docker llama.cpp router PID 1688 (container PID 1, public port
+8080) and loaded child PID 1721 (container PID 26, loopback port 34885). Both
+hold `/dev/dri/renderD129`, PCI `0000:01:00.0`, AMD card1. fdinfo reports amdgpu
+clients 4 and 5; the child's 22,734,296 KiB VRAM allocation is readable **under
+sudo while idle**. `/proc/1721/fd` is permission denied to `haja`. NVIDIA is
+card0/renderD128 at PCI `0000:02:00.0`; Strata's NVML process table remains
+available to the ordinary user.
+
+The service is Compose project `ai-inference`, started by
+`ai-inference.service` in `/opt/ai-inference`; its host PIDs, namespace IDs,
+DRM links/counters, listening owners, sysfs vendor IDs and by-path links are
+recorded in that evidence. The dashboard normally selects the loaded child,
+not the model-less router. hajek.1 itself already places both cards correctly
+under sudo: [installed root capture](mixed-gpu-v2-verification/installed-root.txt).
+The [installed ordinary-user capture](mixed-gpu-v2-verification/installed-user.txt)
+reproduces `other server` on Radeon and `GPU placement unknown`.
+
+### Layered placement and honest provenance
+
+1. **Direct**: driver records held by self **or any descendant**, using host
+   PID ancestry. Recognized `llama-server` children now propagate their placement
+   to a router too, rather than only unnamed workers being folded. DRM client
+   identity deduplicates inherited/duplicated descriptors per server. Container
+   fd links still resolve via `/proc/<pid>/root`, device number and PCI identity.
+   Root/same-user direct placement does not use elimination.
+2. **Inferred**: only after fd access is specifically permission denied, with
+   exactly one unplaced server and exactly one unclaimed GPU showing readable
+   current VRAM use. Other attributed servers exclude their GPUs **before**
+   PID/model-count filtering. Unknowns with no denied local PID, CPU-only
+   servers, missing/failed GPU telemetry, multiple GPUs or multiple unknown
+   servers do not infer. A rescan uses current VRAM, not the startup snapshot.
+   The model data carries `Placement::Inferred(reason)`; headers, layers and
+   comparison cards explicitly say `inferred` and show the elimination reason.
+3. **Configured**: repeatable `--server-gpu PORT=amd|nvidia|intel|pci:ADDRESS`,
+   with comma-separated `LLM_VISUALS_SERVER_GPU` environment mappings. CLI wins
+   for the same port. A public router-port mapping reaches its host-visible
+   descendants even when procfs fd access is denied. Mapping selectors must
+   resolve to exactly one inventory device. Overrides supersede driver evidence
+   and are visibly `configured`, with the owner-supplied mapping in the reason.
+4. **Unknown**: ambiguity stays unknown, with
+   `permission denied reading /proc/<pid>/fd; needs server-user/root access`.
+   No sudo invocation, capability grant or procfs permission change is built in.
+
+Elimination is **not a proof of ownership**. Unrecognized GPU applications can
+invalidate it. Use an explicit mapping when automatic evidence is ambiguous or
+when a stable deployment policy is preferred. Inferred/configured placement
+without matching process counters says per-process VRAM `not measured`, not
+zero or device-total memory. The physical GPU panel remains driver-measured;
+its approximately 15.3 GiB weights / 6.4 GiB KV/other split is an estimate.
+
+The loaded child remains the default model, so aggregate router VRAM is not
+shown as a second model. Explicit router PID/endpoint selection is retained.
+
+### Verification and captures
+
+Final local checks: `cargo test --locked` **160 passed, 0 failed, 2 ignored**;
+`cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`,
+`git diff --check`, and `cargo build --release --locked` all pass. The two
+ignored real-host tests also pass under read-only sudo on inference03:
+[results and exact tested binary hash](mixed-gpu-v2-verification/live-tests.txt).
+Native Linux x86_64 only; Windows/macOS/ARM cross-builds were not run.
+
+New tests cover Cargo version flags; a router, recognized loaded child and
+unnamed grandchild with DRM fd targets; renamed container devices without
+fdinfo; no sibling ownership; shared clients across fork; process-tree cycles;
+restricted procfs/NVML exclusion; inferred provenance; multiple-GPU and
+multiple-server ambiguity; zero/failed VRAM telemetry; explicit mapping
+validation/precedence/descendants; ordinary-user public-router preservation;
+and inferred/configured/unknown UI labels at 150x46 and 100x30.
+The restricted-proc fixture records `PermissionDenied` as an injected access
+outcome, avoiding chmod tests that change behavior when the test runner is root.
+[Router tests failed first on hajek.1 policy](mixed-gpu-v2-verification/red-router.txt),
+as did [version flags](mixed-gpu-v2-verification/red-version.txt).
+
+The first ordinary-user tmux captures were blank even though process detection
+worked. This was resolved by an explicitly sized private tmux session running
+`/bin/bash --noprofile --norc`, then sending the command, with
+`TERM=xterm-256color`; root and user now use the same capture method. Saved
+settings/endpoint environment are isolated, logging is off, and the exact
+[capture script](mixed-gpu-v2-verification/capture.sh) is committed.
+
+Live-verified **idle, no inference request needed**:
+
+- [Root direct](mixed-gpu-v2-verification/fixed-root.txt): Strata G0 RTX 3090,
+  Qwen llama.cpp G1 Radeon, measured process VRAM and device weight/KV split.
+- [Ordinary-user automatic](mixed-gpu-v2-verification/fixed-user.txt): same two
+  models/cards, Radeon `inferred`, 21.7/24.0 GiB device VRAM, weights 15.3 GiB
+  and KV/other 6.4 GiB, all 65 Qwen layer tiles on G1 labelled `inferred`.
+- [Ordinary-user configured](mixed-gpu-v2-verification/fixed-configured.txt):
+  `--server-gpu 8080=pci:0000:01:00.0`, Radeon `configured`, same weight split.
+- [Ordinary-user explicit PID/endpoint](mixed-gpu-v2-verification/fixed-explicit-user.txt):
+  loaded child PID 1712, endpoint `http://127.0.0.1:47121`, Radeon `inferred`.
+  Strata is excluded from display but its GPU still excludes G0 from inference.
+- [Ordinary-user 100x30](mixed-gpu-v2-verification/fixed-user-100x30.txt): both
+  cards and comparison sources remain visible; compact all-layout still lacks
+  the full VRAM legend because of existing layout pressure.
+
+Concurrent externally authorized VM reboots removed the worker's scratch
+path and changed process IDs/ports during verification. Only this worker's
+`/tmp/llm-visuals-mixed-gpu-v2/` scratch directory and private tmux socket were
+created/used. No services, owner tmux sessions, permissions, clocks or inference
+configuration were changed. **Zero inference requests** were sent for this
+follow-up. Read-only llama.cpp endpoint polls were used; no HTTP request was
+sent to Strata :8098.
+
+Final binary SHA-256 (matches the live scratch copy):
+`1c8cc7ac662b41d622563d21c7bacd40b2f6e00032d22505ead7a7660f32a977`.
+
+Prepared archive: `dist/llm-visuals-0.10.0-hajek.2-linux-x86_64.tar.gz`, containing
+only the root executable. Archive SHA-256:
+`3ac0884102be2bfd7dbe3887c18612cf88fc90c409968639f17b2cc3eaafea38`.
+Publication/download verification and exact homelab pin are in the release receipt.
+
+## Original hajek.1 root cause and source base
 
 AMD telemetry already exists in upstream v0.9.0. Upgrading to v0.10.0 alone
 cannot fix this mixed-host bug.

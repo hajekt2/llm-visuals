@@ -1,0 +1,133 @@
+2026-10-02T13:08:10Z
+inference03
+haja
+Linux 6.8.0-142-generic
+=== version ===
+error: unexpected argument '--version' found
+
+Usage: llm-visuals [OPTIONS]
+
+For more information, try '--help'.
+=== process tree ===
+   1665       1 /usr/bin/containerd-shim-runc-v2 -namespace moby -id 0dd12c01ded0e6fa1502a39690cca1827ae986599dc94ec4d1d343ce84df0f20 -address /run/containerd/containerd.sock
+   1688    1665 /app/llama-server --models-preset /config/models.ini --models-max 1 --host 127.0.0.1,172.16.0.73 --port 8080
+   1721    1688 /app/llama-server --host 127.0.0.1 --image-min-tokens 1024 --jinja --metrics --port 34885 --reasoning-effort low --model-draft /models/mtp-Qwen3.8-27B-Q4_0.gguf --spec-type draft-mtp --alias Qwen3.8-27B-Fast --ctx-size 190000 --cache-type-k q4_0 --cache-type-v q4_0 --device Vulkan0 --flash-attn on --model /models/Qwen3.8-27B-UD-Q4_K_M.gguf --mmproj /models/mmproj-BF16.gguf --n-gpu-layers 99 --parallel 1 --reasoning on --split-mode layer --tensor-split 1
+   1973       1 /usr/bin/containerd-shim-runc-v2 -namespace moby -id abfd91d24e49ba1ad9bff4d08590d092083c43ad22bcb8afe32e803b2102f646 -address /run/containerd/containerd.sock
+   1997    1973 .venv/bin/python -m serve.server --engine strata --config /config/config.json --port 8098
+   2085    1997 /opt/strata/build/strata --serve --pack /pack --native /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf --ple-gguf /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf --expert-profile /opt/strata/data/expert-profile.bin --expert-cache auto --prefill auto --max-context 262144 --resident-experts --resident-budget-gib 20 --prompt-cache 6 --conversation-cache-mib 6144 --conversation-cache-slots 2 --conversation-cache-min-free-mib 4096 --vram-reserve-mib 1024 --kv int8 --mtp /mtp/rt --spec 4 --spec-min-p 0.5
+=== non-root fd access ===
+ls: cannot open directory '/proc/1721/fd': Permission denied
+=== root DRM links, fdinfo, namespace ===
+PID 1688
+Name:	llama-server
+PPid:	1665
+Uid:	0	0	0	0
+NSpid:	1688	1
+lrwx------ 1 root root 64 Oct  2 15:06 3 -> /dev/dri/renderD129
+lrwx------ 1 root root 64 Oct  2 15:06 4 -> /dev/dri/renderD129
+/proc/1688/fdinfo/3
+drm-driver:	amdgpu
+drm-client-id:	4
+drm-pdev:	0000:01:00.0
+drm-memory-vram:	4 KiB
+drm-memory-gtt: 	0 KiB
+drm-memory-cpu: 	0 KiB
+drm-shared-vram:	0 KiB
+drm-shared-gtt:	0 KiB
+drm-shared-cpu:	0 KiB
+/proc/1688/fdinfo/4
+drm-driver:	amdgpu
+drm-client-id:	4
+drm-pdev:	0000:01:00.0
+drm-memory-vram:	4 KiB
+drm-memory-gtt: 	0 KiB
+drm-memory-cpu: 	0 KiB
+drm-shared-vram:	0 KiB
+drm-shared-gtt:	0 KiB
+drm-shared-cpu:	0 KiB
+PID 1721
+Name:	llama-server
+PPid:	1688
+Uid:	0	0	0	0
+NSpid:	1721	26
+lrwx------ 1 root root 64 Oct  2 15:06 3 -> /dev/dri/renderD129
+lrwx------ 1 root root 64 Oct  2 15:06 4 -> /dev/dri/renderD129
+/proc/1721/fdinfo/3
+drm-driver:	amdgpu
+drm-client-id:	5
+drm-pdev:	0000:01:00.0
+drm-memory-vram:	22734296 KiB
+drm-memory-gtt: 	473532 KiB
+drm-memory-cpu: 	0 KiB
+drm-shared-vram:	0 KiB
+drm-shared-gtt:	0 KiB
+drm-shared-cpu:	0 KiB
+drm-engine-gfx:	412996852 ns
+drm-engine-compute:	552436914 ns
+/proc/1721/fdinfo/4
+drm-driver:	amdgpu
+drm-client-id:	5
+drm-pdev:	0000:01:00.0
+drm-memory-vram:	22734296 KiB
+drm-memory-gtt: 	473532 KiB
+drm-memory-cpu: 	0 KiB
+drm-shared-vram:	0 KiB
+drm-shared-gtt:	0 KiB
+drm-shared-cpu:	0 KiB
+drm-engine-gfx:	412996852 ns
+drm-engine-compute:	552436914 ns
+PID 1997
+Name:	python
+PPid:	1973
+Uid:	1000	1000	1000	1000
+NSpid:	1997	1
+PID 2085
+Name:	strata
+PPid:	1997
+Uid:	1000	1000	1000	1000
+NSpid:	2085	8
+=== ports ===
+LISTEN 0      512        127.0.0.1:34885      0.0.0.0:*    users:(("llama-server",pid=1721,fd=8))                  
+LISTEN 0      512        127.0.0.1:8080       0.0.0.0:*    users:(("llama-server",pid=1688,fd=8))                  
+LISTEN 0      512      172.16.0.73:8080       0.0.0.0:*    users:(("llama-server",pid=1688,fd=9))                  
+LISTEN 0      4096     172.16.0.73:8098       0.0.0.0:*    users:(("docker-proxy",pid=2068,fd=7))                  
+=== device mapping ===
+total 0
+lrwxrwxrwx 1 root root  8 Oct  2 14:58 pci-0000:01:00.0-card -> ../card1
+lrwxrwxrwx 1 root root 13 Oct  2 14:58 pci-0000:01:00.0-render -> ../renderD129
+lrwxrwxrwx 1 root root  8 Oct  2 14:58 pci-0000:02:00.0-card -> ../card0
+lrwxrwxrwx 1 root root 13 Oct  2 14:58 pci-0000:02:00.0-render -> ../renderD128
+/sys/class/drm/card0 /sys/devices/pci0000:00/0000:00:1c.1/0000:02:00.0 0x10de
+/sys/class/drm/card1 /sys/devices/pci0000:00/0000:00:1c.0/0000:01:00.0 0x1002
+=== deployment ownership ===
+ai-strata-strata-1 cb53e3711eb3
+ai-inference-llama-server-1 5a7069fc2268
+/ai-inference-llama-server-1 host-pid=1688 compose=ai-inference
+/ai-strata-strata-1 host-pid=1997 compose=ai-strata
+# /etc/systemd/system/ai-inference.service
+[Unit]
+Description=Qwen3.8 llama.cpp inference
+Requires=docker.service
+After=docker.service network-online.target
+RequiresMountsFor=/srv/ai-models
+Wants=inference-radeon-clock.service
+After=inference-radeon-clock.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/ai-inference
+ExecStartPre=/usr/bin/nvidia-smi --query-gpu=name --format=csv,noheader
+ExecStartPre=/usr/bin/python3 /usr/local/sbin/inference-radeon-clock.py apply --mhz 2200
+ExecStart=/usr/bin/docker compose up -d --wait
+ExecStop=/usr/bin/docker compose down
+ExecStopPost=/usr/bin/python3 /usr/local/sbin/inference-radeon-clock.py reset
+TimeoutStartSec=1200
+
+[Install]
+WantedBy=multi-user.target
+
+# /etc/systemd/system/ai-inference.service.d/radeon-drm.conf
+[Service]
+# Resolve current DRM minor names from stable PCI identity before Compose starts.
+ExecStartPre=/usr/bin/python3 /opt/ai-inference/radeon-drm-env.py --pci 0000:01:00.0

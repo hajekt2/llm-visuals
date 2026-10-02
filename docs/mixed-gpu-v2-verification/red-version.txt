@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/llm_visuals-89dd487c38d12637)
+
+running 1 test
+
+thread 'config::tests::standard_version_flags_use_cargo_version' (1824377) panicked at src/config.rs:245:13:
+assertion `left == right` failed
+  left: UnknownArgument
+ right: DisplayVersion
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test config::tests::standard_version_flags_use_cargo_version ... FAILED
+
+failures:
+
+failures:
+    config::tests::standard_version_flags_use_cargo_version
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 152 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--bin llm-visuals`

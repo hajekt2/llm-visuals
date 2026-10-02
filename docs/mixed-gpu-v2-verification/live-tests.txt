@@ -1,0 +1,21 @@
+
+running 1 test
+detected: Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002 (PID 1986 · strata · GPU 0 · 23412 MB) port=Some(8098) layers=0 heads=0 experts=0/0
+detected: Qwen3.8-27B-UD-Q4_K_M (PID 1712 · llama.cpp · GPU 1 · 22201 MB) port=Some(47121) layers=65 heads=24 experts=0/0
+detected: llama-server (PID 1679 · llama.cpp · GPU 1 · 22201 MB) port=Some(8080) layers=0 heads=0 experts=0/0
+test model_detect::tests::detects_live_servers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 161 filtered out; finished in 0.71s
+
+
+running 1 test
+gpu: idx=0 name='NVIDIA GeForce RTX 3090' vram=23461/24576MB util_gpu=0 util_mem=0 14.793W/300W temp=Some(32.0) clk=210/2100MHz
+gpu: idx=1 name='Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M] (rev c8)' vram=22228/24560MB util_gpu=0 util_mem=0 4W/294W temp=Some(29.0) clk=0/2482MHz
+test gpu::live_tests::collects_live_gpu_stats ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 161 filtered out; finished in 0.04s
+
+llm-visuals 0.10.0-hajek.2
+llm-visuals 0.10.0-hajek.2
+1c8cc7ac662b41d622563d21c7bacd40b2f6e00032d22505ead7a7660f32a977  /tmp/llm-visuals-mixed-gpu-v2/llm-visuals
+2026-10-02T13:34:56Z
