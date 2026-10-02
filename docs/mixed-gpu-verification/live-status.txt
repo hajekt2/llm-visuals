@@ -1,0 +1,6 @@
+/sys/class/drm/card0 vendor=0x10de PCI_SLOT_NAME=0000:02:00.0
+/sys/class/drm/card1 vendor=0x1002 PCI_SLOT_NAME=0000:01:00.0
+1674
+1705
+2064, /opt/strata/build/strata, 23412
+llama.cpp model IDs: ['Qwen3.8-27B-Fast', 'Qwen3.8-27B-Full-Fast']
