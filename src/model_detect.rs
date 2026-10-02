@@ -1626,7 +1626,12 @@ fn render_node_pci(process: &Path, fd: &std::ffi::OsStr, sys_root: &Path) -> Opt
             {
                 return Some(pci);
             }
+        } else {
+            return None; // a regular file named renderD128 is not a GPU
         }
+    }
+    if target.parent() != Some(Path::new("/dev/dri")) {
+        return None;
     }
     let node = target.file_name()?.to_str()?;
     let suffix = node.strip_prefix("renderD")?;
@@ -2242,6 +2247,29 @@ mod tests {
                 host.write(format!("proc/{pid}/fdinfo/7"), info);
             }
         }
+        // Similar filenames do not establish DRM ownership, even when a
+        // container has a regular file under /dev/dri with that basename.
+        for pid in [118, 119] {
+            host.write(format!("proc/{pid}/comm"), "llama-server\n");
+            std::fs::create_dir_all(host.root.join(format!("proc/{pid}/fd"))).unwrap();
+            symlink(
+                if pid == 118 {
+                    "/tmp/renderD129"
+                } else {
+                    "/dev/dri/renderD9129"
+                },
+                host.root.join(format!("proc/{pid}/fd/7")),
+            )
+            .unwrap();
+        }
+        host.write(
+            "proc/119/root/dev/dri/renderD9129",
+            "not a character device",
+        );
+        host.write(
+            "sys/class/drm/renderD9129/device/uevent",
+            "PCI_SLOT_NAME=0000:43:00.0\n",
+        );
         // dup() of the same DRM client is not a second VRAM allocation.
         host.write("proc/114/fdinfo/8", fdinfo);
         // A second client is added, not deduplicated against the first.
