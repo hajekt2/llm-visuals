@@ -14,6 +14,7 @@ pub struct DetectedModel {
     pub process_name: String,
     pub engine: String,
     pub gpu_indices: Vec<u32>,
+    pub placement: crate::placement::Placement,
     pub mem_used_mb: u64,
     /// Address the pollers dial. A wildcard bind (`0.0.0.0`, `::`) stays
     /// on loopback, which can still reach it. A specific `--host` is kept,
@@ -153,9 +154,23 @@ impl DetectedModel {
             }
     }
 
-    /// Whether this looks like a bare daemon with nothing loaded.
+    fn is_llama_router(&self) -> bool {
+        self.engine == "llama.cpp"
+            && self.cmdline.split_whitespace().any(|arg| {
+                matches!(
+                    arg.split('=').next(),
+                    Some("--models-preset" | "--models-dir")
+                )
+            })
+    }
+
+    /// Keep routers until public-port configuration and child deduplication.
+    /// Otherwise restricted /proc would hide the only 8080 mapping target.
     fn is_idle_daemon(&self) -> bool {
-        self.mem_used_mb == 0 && self.path.is_none() && self.gguf.is_none()
+        self.mem_used_mb == 0
+            && self.path.is_none()
+            && self.gguf.is_none()
+            && !self.is_llama_router()
     }
 
     pub fn n_layers(&self) -> usize {
@@ -411,13 +426,13 @@ fn ppid_from_stat(txt: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn parent_pid(pid: u32) -> Option<u32> {
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     let txt = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     ppid_from_stat(&txt)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn parent_pid(_pid: u32) -> Option<u32> {
+pub(crate) fn parent_pid(_pid: u32) -> Option<u32> {
     None
 }
 
@@ -592,22 +607,18 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
     gpu_procs.extend(amd_compute_apps(inventory));
     let mut by_pid: std::collections::HashMap<u32, DetectedModel> =
         std::collections::HashMap::new();
-    // Worker process names / inherited argv need not identify a server.
-    // Defer them until the /proc scan has found their host-visible launcher.
-    let mut worker_apps = Vec::new();
-
-    for app in gpu_procs {
+    // Placement is applied after the process scan and adapter folding, so a
+    // GPU-owning child is evidence for every detected server in its ancestry.
+    for app in &gpu_procs {
         let cmdline = read_cmdline(app.pid).unwrap_or_else(|| app.process_name.clone());
         if is_self(app.pid, &cmdline) {
             continue;
         }
         if is_sglang_worker(&app.process_name) || !looks_like_llm(&app.process_name, &cmdline) {
-            worker_apps.push(app);
             continue;
         }
         let mut parsed = parse_cmdline(&app.process_name, &cmdline);
         if parsed.engine == "vllm" && is_vllm_phantom(&app.process_name, &cmdline) {
-            worker_apps.push(app);
             continue;
         }
         if parsed.engine == "vllm" {
@@ -616,13 +627,14 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
         if parsed.engine == "sglang" {
             parsed.port = resolve_container_host_port(app.pid, parsed.port, 30000);
         }
-        let entry = by_pid.entry(app.pid).or_insert_with(|| DetectedModel {
+        by_pid.entry(app.pid).or_insert_with(|| DetectedModel {
             name: parsed.name.clone(),
             path: parsed.path.clone(),
             pid: app.pid,
             process_name: app.process_name.clone(),
             engine: parsed.engine.clone(),
             gpu_indices: Vec::new(),
+            placement: Default::default(),
             mem_used_mb: 0,
             host: parsed.host.clone(),
             port: parsed.port,
@@ -635,7 +647,6 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
             tensors: None,
             vision: None,
         });
-        add_gpu_app(entry, &app);
     }
 
     // /proc scan for engines that might not appear in nvidia-smi
@@ -672,6 +683,7 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
                 process_name: name,
                 engine: parsed.engine,
                 gpu_indices: Vec::new(),
+                placement: Default::default(),
                 mem_used_mb: 0,
                 host: parsed.host,
                 port: parsed.port,
@@ -687,13 +699,8 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
         );
     }
 
-    for app in worker_apps {
-        if let Some(pid) = server_ancestor(app.pid, |pid| by_pid.contains_key(&pid), parent_pid) {
-            add_gpu_app(by_pid.get_mut(&pid).unwrap(), &app);
-        }
-    }
-
     fold_strata_workers(&mut by_pid, parent_pid);
+    attribute_gpu_apps(&mut by_pid, &gpu_procs, parent_pid);
 
     // Engines pinned by environment (ZE_AFFINITY_MASK on Intel, which has
     // no compute-app table) have no driver-reported placement; recover it
@@ -758,6 +765,36 @@ pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
         models.retain(|m| !m.is_idle_daemon());
     }
     models
+}
+
+/// Keep the loaded llama.cpp children as the normal dashboard entries, not a
+/// second copy of their router's aggregate VRAM. Explicit PID/endpoint choices
+/// can still select the router and use its descendant placement.
+pub fn prune_redundant_routers(models: &mut Vec<DetectedModel>, keep: &[u32]) {
+    prune_redundant_routers_with(models, keep, parent_pid);
+}
+
+fn prune_redundant_routers_with(
+    models: &mut Vec<DetectedModel>,
+    keep: &[u32],
+    parent: impl Fn(u32) -> Option<u32>,
+) {
+    let redundant: Vec<_> = models
+        .iter()
+        .filter(|router| {
+            !keep.contains(&router.pid)
+                && router.is_llama_router()
+                && router.path.is_none()
+                && router.gguf.is_none()
+                && models.iter().any(|child| {
+                    child.engine == "llama.cpp"
+                        && child.path.is_some()
+                        && server_ancestor(child.pid, |pid| pid == router.pid, &parent).is_some()
+                })
+        })
+        .map(|m| m.pid)
+        .collect();
+    models.retain(|m| !redundant.contains(&m.pid));
 }
 
 /// This dashboard is itself a process with `--model` on its command line;
@@ -1376,11 +1413,59 @@ fn server_ancestor(
     None
 }
 
+/// A router can itself look like an LLM, as can its GPU-owning child.
+/// Attribute only observed driver records, to self and detected ancestors,
+/// never siblings or a guessed GPU. Host PIDs keep container ancestry intact.
+fn attribute_gpu_apps(
+    models: &mut std::collections::HashMap<u32, DetectedModel>,
+    apps: &[ComputeApp],
+    parent: impl Fn(u32) -> Option<u32>,
+) {
+    let mut clients = std::collections::HashMap::<(u32, u32, String), u64>::new();
+    for app in apps {
+        let mut pid = app.pid;
+        let mut visited = std::collections::HashSet::new();
+        // Bound races, corrupt trees and process exit without following cycles.
+        for _ in 0..64 {
+            if !visited.insert(pid) {
+                break;
+            }
+            if let Some(model) = models.get_mut(&pid) {
+                let mut mem_used_mb = app.mem_used_mb;
+                if !app.drm_clients.is_empty() {
+                    mem_used_mb = 0;
+                    for (id, mem_kib) in &app.drm_clients {
+                        // fork/dup can expose the same DRM client in multiple
+                        // descendants. Count its allocation once per server.
+                        let old = clients.entry((pid, app.gpu_index, id.clone())).or_default();
+                        mem_used_mb += (mem_kib / 1024).saturating_sub(*old / 1024);
+                        *old = (*old).max(*mem_kib);
+                    }
+                }
+                add_gpu_app(
+                    model,
+                    &ComputeApp {
+                        mem_used_mb,
+                        ..app.clone()
+                    },
+                );
+            }
+            let Some(ppid) = parent(pid).filter(|p| *p > 1) else {
+                break;
+            };
+            pid = ppid;
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ComputeApp {
     pid: u32,
     process_name: String,
     gpu_index: u32,
     mem_used_mb: u64,
+    /// DRM client identity and KiB allocation, for deduplication across fork.
+    drm_clients: Vec<(String, u64)>,
 }
 
 fn gpu_uuid_index_map() -> std::collections::HashMap<String, u32> {
@@ -1464,6 +1549,7 @@ fn parse_nvidia_apps(
             process_name,
             gpu_index,
             mem_used_mb: mem_used,
+            drm_clients: Vec::new(),
         });
     }
     apps
@@ -1574,20 +1660,30 @@ fn amd_compute_apps_at(
         }
     }
 
-    let mut per_process: HashMap<(u32, u32), u64> = HashMap::new();
-    for ((pid, gpu_index, _), mem_kib) in clients {
-        *per_process.entry((pid, gpu_index)).or_default() += mem_kib;
+    let mut per_process: HashMap<(u32, u32), Vec<(String, u64)>> = HashMap::new();
+    for ((pid, gpu_index, id), mem_kib) in clients {
+        // Without a client ID we cannot deduplicate across different PIDs.
+        let id = if id == "unknown" {
+            format!("unknown-pid-{pid}")
+        } else {
+            id
+        };
+        per_process
+            .entry((pid, gpu_index))
+            .or_default()
+            .push((id, mem_kib));
     }
     per_process
         .into_iter()
-        .map(|((pid, gpu_index), mem_kib)| ComputeApp {
+        .map(|((pid, gpu_index), drm_clients)| ComputeApp {
             pid,
             process_name: std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
             gpu_index,
-            mem_used_mb: mem_kib / 1024,
+            mem_used_mb: drm_clients.iter().map(|(_, mem)| mem).sum::<u64>() / 1024,
+            drm_clients,
         })
         .collect()
 }
@@ -2011,6 +2107,7 @@ pub async fn probe_endpoint(
         process_name: format!("{engine} (:{port})"),
         engine,
         gpu_indices,
+        placement: Default::default(),
         mem_used_mb: 0,
         host: host.to_string(),
         port: Some(port),
@@ -2323,6 +2420,151 @@ mod tests {
         assert!(apps.iter().all(|a| a.gpu_index == 0));
     }
 
+    #[cfg(target_os = "linux")]
+    fn router_fixture() -> std::collections::HashMap<u32, DetectedModel> {
+        use std::os::unix::fs::symlink;
+        let host = crate::test_support::MixedHost::new();
+        let processes: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/mixed-gpu/router-process-tree.json"
+        ))
+        .unwrap();
+        let mut models = std::collections::HashMap::new();
+        for process in processes.as_array().unwrap() {
+            let pid = process["pid"].as_u64().unwrap() as u32;
+            let ppid = process["ppid"].as_u64().unwrap() as u32;
+            let name = process["comm"].as_str().unwrap();
+            let cmd = process["cmdline"].as_str().unwrap();
+            host.write(
+                format!("proc/{pid}/stat"),
+                format!("{pid} ({name}) S {ppid} 0 0\n"),
+            );
+            host.write(format!("proc/{pid}/comm"), name);
+            if looks_like_llm(name, cmd) {
+                let mut model = crate::demo::demo_models(8192, 1).remove(0);
+                let parsed = parse_cmdline(name, cmd);
+                model.pid = pid;
+                model.engine = parsed.engine;
+                model.path = parsed.path;
+                model.gguf = None;
+                model.cmdline = cmd.into();
+                model.gpu_indices.clear();
+                model.mem_used_mb = 0;
+                models.insert(pid, model);
+            }
+            if let Some(target) = process["fd"].as_str() {
+                std::fs::create_dir_all(host.root.join(format!("proc/{pid}/fd"))).unwrap();
+                symlink(target, host.root.join(format!("proc/{pid}/fd/3"))).unwrap();
+                if let Some(info) = process["fdinfo"].as_str() {
+                    host.write(format!("proc/{pid}/fdinfo/3"), info);
+                    host.write(format!("proc/{pid}/fdinfo/4"), info); // dup, not more VRAM
+                }
+                if process["container"].as_bool() == Some(true) {
+                    std::fs::create_dir_all(host.root.join(format!("proc/{pid}/root/dev")))
+                        .unwrap();
+                    symlink(
+                        "/dev/null",
+                        host.root.join(format!("proc/{pid}/root/dev/container-amd")),
+                    )
+                    .unwrap();
+                    // Fixture character device's number stands in for passed-through DRM.
+                    host.write(
+                        "sys/dev/char/1:3/device/uevent",
+                        "PCI_SLOT_NAME=0000:43:00.0\n",
+                    );
+                }
+            }
+        }
+        let inventory = vec![GpuStats {
+            index: 1,
+            backend: "amd",
+            pci_address: Some("0000:43:00.0".into()),
+            ..Default::default()
+        }];
+        let apps = amd_compute_apps_at(&inventory, &host.root.join("proc"), &host.root.join("sys"));
+        attribute_gpu_apps(&mut models, &apps, |pid| {
+            let stat = std::fs::read_to_string(host.root.join(format!("proc/{pid}/stat"))).ok()?;
+            ppid_from_stat(&stat)
+        });
+        models
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn router_inherits_recognized_child_gpu_while_idle() {
+        let models = router_fixture();
+        assert_eq!(models[&1721].gpu_indices, vec![1]);
+        assert_eq!(models[&1688].gpu_indices, vec![1]);
+        assert_eq!(models[&1688].mem_used_mb, 22_201);
+        assert_eq!(models[&1721].mem_used_mb, 22_201);
+        assert!(models[&2000].gpu_indices.is_empty()); // unrelated server, no GPU FD
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn router_inherits_container_child_render_node_without_fdinfo() {
+        let models = router_fixture();
+        assert_eq!(models[&3026].gpu_indices, vec![1]);
+        assert_eq!(models[&3000].gpu_indices, vec![1]);
+        assert_eq!(models[&3000].mem_used_mb, 0); // placement, not invented VRAM
+        assert!(models[&2000].gpu_indices.is_empty());
+    }
+
+    #[test]
+    fn restricted_proc_router_remains_a_public_port_mapping_target() {
+        let mut model = crate::demo::demo_models(8192, 1).remove(0);
+        model.engine = "llama.cpp".into();
+        model.cmdline = "llama-server --models-preset /config/models.ini --port 8080".into();
+        model.path = None;
+        model.gguf = None;
+        model.gpu_indices.clear();
+        model.mem_used_mb = 0;
+        assert!(!model.is_idle_daemon());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn redundant_router_is_hidden_unless_explicitly_requested() {
+        let parent = |pid| match pid {
+            1721 => Some(1688),
+            3026 => Some(3000),
+            _ => None,
+        };
+        let mut models: Vec<_> = router_fixture().into_values().collect();
+        prune_redundant_routers_with(&mut models, &[1688], parent);
+        assert!(models.iter().any(|m| m.pid == 1688));
+        assert!(!models.iter().any(|m| m.pid == 3000));
+        assert!(models.iter().any(|m| m.pid == 2000)); // not a router
+        prune_redundant_routers_with(&mut models, &[], parent);
+        assert!(!models.iter().any(|m| m.pid == 1688));
+        assert!(models.iter().any(|m| m.pid == 1721));
+    }
+
+    #[test]
+    fn descendant_clients_deduplicate_across_fork_and_bound_cycles() {
+        let mut model = crate::demo::demo_models(8192, 1).remove(0);
+        model.pid = 100;
+        model.gpu_indices.clear();
+        model.mem_used_mb = 0;
+        let mut models = std::collections::HashMap::from([(100, model)]);
+        let apps = [200, 300].map(|pid| ComputeApp {
+            pid,
+            process_name: "worker".into(),
+            gpu_index: 1,
+            mem_used_mb: 16,
+            drm_clients: vec![("shared-client".into(), 16 * 1024)],
+        });
+        let parent = |pid| match pid {
+            200 | 300 => Some(100),
+            100 => Some(200),
+            _ => None,
+        };
+        attribute_gpu_apps(&mut models, &apps, parent);
+        assert_eq!(models[&100].gpu_indices, vec![1]);
+        assert_eq!(models[&100].mem_used_mb, 16); // not 32, even with a cycle
+        attribute_gpu_apps(&mut models, &[], parent); // unreadable driver records are not guesses
+        assert_eq!(models[&100].mem_used_mb, 16);
+    }
+
     #[test]
     fn strata_gpu_process_is_a_server_not_an_unidentified_worker() {
         let cmd = "/opt/strata/build/strata --serve --pack /pack --native --ple-gguf /models/Qwen-Flash-Next.gguf";
@@ -2381,6 +2623,7 @@ mod tests {
                     process_name: "worker".into(),
                     gpu_index: index,
                     mem_used_mb: mb,
+                    drm_clients: Vec::new(),
                 },
             );
         }
@@ -2536,7 +2779,7 @@ mod tests {
     #[ignore = "live check: run on a host with real servers, e.g. docker run --pid:host"]
     fn detects_live_servers() {
         let inventory = crate::gpu::GpuBackend::detect(crate::nvml::NvmlSession::new()).inventory();
-        let models = detect_models(&inventory);
+        let mut models = detect_models(&inventory);
         for m in &models {
             eprintln!(
                 "detected: {m} port={:?} layers={} heads={} experts={}/{}",
@@ -2551,6 +2794,9 @@ mod tests {
             !models.is_empty(),
             "no inference servers detected on this host"
         );
+        // Check the actual default dashboard entries, not a router's aggregate
+        // placement entry, which has no model topology of its own.
+        prune_redundant_routers(&mut models, &[]);
         // Topology must not fall back to the "1 layer" clamp when the
         // served model is a safetensors dir: either GGUF or HF config
         // metadata has to provide real numbers.
@@ -2738,6 +2984,7 @@ mod tests {
             process_name: "vllm (:7000)".into(),
             engine: "vllm".into(),
             gpu_indices: vec![],
+            placement: Default::default(),
             mem_used_mb: 0,
             host: "127.0.0.1".into(),
             port: Some(7000),

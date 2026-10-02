@@ -13,6 +13,7 @@ pub mod nvml;
 mod observe;
 mod perf;
 mod pipeline;
+mod placement;
 mod render;
 mod settings;
 mod sglang;
@@ -158,6 +159,34 @@ async fn discover(
         proc_models = model_detect::probe_local_endpoints(auth).await;
     }
 
+    let mappings = placement::mappings(
+        std::env::var("LLM_VISUALS_SERVER_GPU").ok().as_deref(),
+        &args.server_gpu,
+    );
+    if let Err(error) = placement::configure(
+        &mut proc_models,
+        inventory,
+        &mappings,
+        model_detect::parent_pid,
+    ) {
+        explicit_error = Some(error);
+    }
+    let mut keep = filter.clone();
+    keep.extend(
+        proc_models
+            .iter()
+            .filter(|m| {
+                explicit_models
+                    .iter()
+                    .any(|ep| ep.port.is_some() && ep.port == m.port)
+            })
+            .map(|m| m.pid),
+    );
+    model_detect::prune_redundant_routers(&mut proc_models, &keep);
+    // Use all detected servers as exclusion evidence before --pid or
+    // --max-models hides their cards from the monitored model list.
+    placement::infer_denied(&mut proc_models, inventory, placement::denied_reason);
+
     // Filter process-detected models by PID if requested (exempt explicitly requested endpoints)
     if !filter.is_empty() {
         proc_models.retain(|m| filter.contains(&m.pid));
@@ -180,6 +209,7 @@ async fn discover(
                 }
                 if fm.gpu_indices.is_empty() {
                     fm.gpu_indices = m.gpu_indices;
+                    fm.placement = m.placement;
                 }
                 if fm.mem_used_mb == 0 {
                     fm.mem_used_mb = m.mem_used_mb;
@@ -206,6 +236,13 @@ async fn discover(
         } else {
             found.push(m);
         }
+    }
+    // Also support explicitly probed endpoints that have no host PID. These
+    // can be configured, never eliminated without a denied local process.
+    if let Err(error) =
+        placement::configure(&mut found, inventory, &mappings, model_detect::parent_pid)
+    {
+        explicit_error = Some(error);
     }
     found.truncate(args.max_models.max(1));
     // `llama-server -hf owner/repo:quant` does not put a local GGUF path on
@@ -862,7 +899,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h.abort();
             }
             // Keep the counters of models that are still up.
-            let (found, rescan_err) = discover(&args, &auth, &inventory).await;
+            // Elimination needs current VRAM, not the cached startup snapshot.
+            // A failed poll retains identity but cannot supply inference evidence.
+            let current_inventory = gpu_backend
+                .as_ref()
+                .and_then(|b| b.collect().ok())
+                .unwrap_or_else(|| {
+                    inventory
+                        .iter()
+                        .cloned()
+                        .map(|mut g| {
+                            g.mem_used_mb = 0;
+                            g.telemetry_error = Some("GPU poll unavailable".into());
+                            g
+                        })
+                        .collect()
+                });
+            let (found, rescan_err) = discover(&args, &auth, &current_inventory).await;
             let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
             for m in found {
                 match slots.iter().position(|s| s.model.key() == m.key()) {

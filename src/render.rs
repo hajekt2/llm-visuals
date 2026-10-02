@@ -368,6 +368,26 @@ impl Renderer {
                         Span::styled(format!(" pid {}", m.pid), st(pal::TEXT_DIM)),
                     ],
                 ));
+                if let Some(reason) = m.placement.reason() {
+                    let gpus = m
+                        .gpu_indices
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let gpu = if gpus.is_empty() { "?" } else { &gpus };
+                    segs.push((
+                        10,
+                        vec![Span::styled(
+                            format!(
+                                "GPU {gpu} {}: {}",
+                                m.placement.label(),
+                                reason.split(';').next().unwrap_or(reason)
+                            ),
+                            st(pal::AMBER),
+                        )],
+                    ));
+                }
                 if let Some(g) = &m.gguf {
                     segs.push((4, vec![Span::styled(g.architecture.clone(), st(pal::TEXT))]));
                     segs.push((
@@ -1479,8 +1499,12 @@ impl Renderer {
             format!(" ◆ LAYERS  {n} · GPU placement unknown ")
         } else {
             format!(
-                " ◆ LAYERS  {n} across {n_gpus} GPU{} ",
-                if n_gpus > 1 { "s" } else { "" }
+                " ◆ LAYERS  {n} across {n_gpus} GPU{}{} ",
+                if n_gpus > 1 { "s" } else { "" },
+                d.detected
+                    .filter(|m| !matches!(m.placement, crate::placement::Placement::Direct))
+                    .map(|m| format!(" · {}", m.placement.label()))
+                    .unwrap_or_default()
             )
         };
         let right = Line::from(Span::styled(
@@ -2908,7 +2932,11 @@ impl Renderer {
         }
         lines.push(kv(
             "vram",
-            format!("{:.1} G", m.detected.mem_used_mb as f32 / 1024.0),
+            if m.detected.mem_used_mb == 0 && m.detected.placement.reason().is_some() {
+                "not measured".into()
+            } else {
+                format!("{:.1} G", m.detected.mem_used_mb as f32 / 1024.0)
+            },
             pal::BLUE,
         ));
         if !m.detected.gpu_indices.is_empty() {
@@ -2922,6 +2950,20 @@ impl Renderer {
                     .join(","),
                 pal::AMBER,
             ));
+        }
+        if let Some(reason) = m.detected.placement.reason() {
+            lines.push(kv(
+                "source",
+                m.detected.placement.label().into(),
+                pal::AMBER,
+            ));
+            // Multiple lines preserve the exact access-denial cause in compact cards.
+            for chunk in reason.chars().collect::<Vec<_>>().chunks(w.max(1)) {
+                lines.push(Line::from(Span::styled(
+                    chunk.iter().collect::<String>(),
+                    Style::default().fg(pal::c(pal::TEXT_DIM)),
+                )));
+            }
         }
         lines.push(kv(
             "session",
@@ -4433,6 +4475,54 @@ mod tests {
             .collect();
         assert!(text.contains("GPU placement unknown"));
         assert!(text.chars().filter(|&c| c == '?').count() >= 41);
+
+        for provenance in [
+            crate::placement::Placement::Inferred(
+                "sole unclaimed GPU with VRAM used; permission denied reading /proc/1721/fd".into(),
+            ),
+            crate::placement::Placement::Configured("8080=amd (owner supplied)".into()),
+            crate::placement::Placement::Unavailable(
+                "permission denied reading /proc/1721/fd; needs server-user/root access".into(),
+            ),
+        ] {
+            let mut annotated = model.clone();
+            annotated.name = "Qwen3.8-27B".into();
+            annotated.placement = provenance;
+            let annotated_models = [ModelView {
+                detected: &annotated,
+                ..models[0]
+            }];
+            let annotated_d = Dashboard {
+                detected: Some(&annotated),
+                models: &annotated_models,
+                ..d
+            };
+            for (width, height) in [(150, 46), (100, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| renderer.render_header(f, Rect::new(0, 0, width, 3), &annotated_d))
+                    .unwrap();
+                let header: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(header.contains(annotated.placement.label()), "{header}");
+                terminal
+                    .draw(|f| renderer.render_model_card(f, f.area(), 0, &annotated_d))
+                    .unwrap();
+                let card: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(card.contains(annotated.placement.label()), "{card}");
+            }
+        }
     }
 
     #[test]

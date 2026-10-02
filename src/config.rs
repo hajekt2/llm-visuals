@@ -34,6 +34,7 @@ impl std::fmt::Display for ViewMode {
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "llm-visuals",
+    version,
     about = "Real-time terminal dashboard for a locally running LLM",
     // Saved settings are passed ahead of the real command line, so a flag
     // given twice must take its last value rather than be an error.
@@ -123,6 +124,11 @@ pub struct Args {
     /// Maximum number of detected models to monitor at once
     #[arg(long, default_value_t = 8)]
     pub max_models: usize,
+
+    /// Override server GPU placement: PORT=amd|nvidia|intel|pci:0000:01:00.0 (repeatable).
+    /// Environment fallback: LLM_VISUALS_SERVER_GPU, comma-separated mappings.
+    #[arg(long, value_name = "PORT=SELECTOR")]
+    pub server_gpu: Vec<String>,
 
     /// Only monitor these PIDs (comma-separated); default is every model found
     #[arg(long, default_value = "all")]
@@ -237,6 +243,37 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_gpu_mapping_is_repeatable_without_changing_existing_flags() {
+        let args = Args::try_parse_from([
+            "llm-visuals",
+            "--server-gpu",
+            "8080=amd",
+            "--server-gpu",
+            "8098=pci:0000:02:00.0",
+            "--pid",
+            "1721",
+            "--log-db",
+            "off",
+        ])
+        .unwrap();
+        assert_eq!(args.server_gpu, ["8080=amd", "8098=pci:0000:02:00.0"]);
+        assert_eq!(args.pid_filter(), [1721]);
+        assert_eq!(args.log_db, "off");
+    }
+
+    #[test]
+    fn standard_version_flags_use_cargo_version() {
+        for flag in ["--version", "-V"] {
+            let error = Args::try_parse_from(["llm-visuals", flag]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("llm-visuals {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
 
     #[test]
     fn endpoint_precedence_and_model_hijack_prevention() {
