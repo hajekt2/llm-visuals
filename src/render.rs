@@ -1473,10 +1473,16 @@ impl Renderer {
             })
             .unwrap_or_else(|| d.gpus.len().max(1));
         let n_gpus = model_gpu_count;
-        let title = format!(
-            " ◆ LAYERS  {n} across {n_gpus} GPU{} ",
-            if n_gpus > 1 { "s" } else { "" }
-        );
+        let title = if d.detected.is_some_and(|m| m.gpu_indices.is_empty())
+            && crate::gpu::is_mixed(d.gpus)
+        {
+            format!(" ◆ LAYERS  {n} · GPU placement unknown ")
+        } else {
+            format!(
+                " ◆ LAYERS  {n} across {n_gpus} GPU{} ",
+                if n_gpus > 1 { "s" } else { "" }
+            )
+        };
         let right = Line::from(Span::styled(
             format!(" theme {} ", self.theme.name),
             Style::default().fg(pal::c(pal::TEXT_MUTED)),
@@ -1516,7 +1522,11 @@ impl Renderer {
             } else {
                 pal::c(pal::TEXT)
             };
-            let tag_col = pal::c(gpu_tags[gpu % gpu_tags.len()]);
+            let tag_col = pal::c(if gpu == crate::gpu::UNKNOWN_GPU {
+                pal::TEXT_DIM
+            } else {
+                gpu_tags[gpu % gpu_tags.len()]
+            });
             let inner_w = tw.saturating_sub(1); // 1-col gutter between tiles
             for dy in 0..th {
                 let y = y0 + dy;
@@ -1548,7 +1558,12 @@ impl Renderer {
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else if dy == 0 && dx == inner_w - 1 && inner_w >= 5 {
-                        Span::styled(format!("{gpu}"), Style::default().fg(tag_col).bg(bg))
+                        let tag = if gpu == crate::gpu::UNKNOWN_GPU {
+                            "?".into()
+                        } else {
+                            format!("{gpu}")
+                        };
+                        Span::styled(tag, Style::default().fg(tag_col).bg(bg))
                     } else if bottom && !hist.is_empty() {
                         let n_h = hist.len();
                         let start = n_h.saturating_sub(inner_w);
@@ -4397,6 +4412,26 @@ mod tests {
             .draw(|f| renderer.render_gpus(f, f.area(), &d))
             .unwrap();
         assert_eq!(terminal.backend().buffer(), &before);
+        let mut unknown_model = model.clone();
+        unknown_model.gpu_indices.clear();
+        let mut unknown_fade = FadeState::new();
+        unknown_fade.layer_gpu = vec![crate::gpu::UNKNOWN_GPU; 41];
+        d.detected = Some(&unknown_model);
+        d.fade = &unknown_fade;
+        d.gpus = &gpus;
+        let mut terminal = Terminal::new(TestBackend::new(150, 46)).unwrap();
+        terminal
+            .draw(|f| renderer.render_layers(f, f.area(), &d))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("GPU placement unknown"));
+        assert!(text.chars().filter(|&c| c == '?').count() >= 41);
     }
 
     #[test]

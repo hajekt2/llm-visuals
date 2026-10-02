@@ -1167,13 +1167,23 @@ fn fade_sample_from_live(
     }
     let n_layers = n_layers.max(1);
     let model_gpus: Vec<u32> = detected.map(|d| d.gpu_indices.clone()).unwrap_or_default();
+    let unknown_placement = detected.is_some() && model_gpus.is_empty() && gpu::is_mixed(gpu);
     let layer_gpu: Vec<usize> = (0..n_layers)
-        .map(|l| layer_device(l, n_layers, &split, &model_gpus))
+        .map(|l| {
+            if unknown_placement {
+                gpu::UNKNOWN_GPU
+            } else {
+                layer_device(l, n_layers, &split, &model_gpus)
+            }
+        })
         .collect();
     let processing = live.processing;
     let layer_target: Vec<f32> = (0..n_layers)
         .map(|l| {
             let dev = layer_gpu[l];
+            if dev == gpu::UNKNOWN_GPU {
+                return 0.0;
+            }
             let u = if detected.is_some_and(|m| !m.uses_gpu(dev as u32, gpu)) {
                 0.0
             } else {
@@ -1340,7 +1350,8 @@ mod tests {
         assert_eq!(sample.model_owned, vec![false, false]);
         assert_eq!(sample.weight_frac, vec![0.0, 0.0]);
         assert_eq!(sample.kv_alloc_frac, vec![0.0, 0.0]);
-        assert!(sample.layer_target.iter().all(|&u| u <= 0.08));
+        assert!(sample.layer_gpu.iter().all(|&g| g == gpu::UNKNOWN_GPU));
+        assert!(sample.layer_target.iter().all(|&u| u == 0.0));
         model.gpu_indices = vec![1];
         let mut slot = ModelSlot::new(model);
         slot.observe_host(

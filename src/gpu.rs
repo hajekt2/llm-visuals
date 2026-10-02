@@ -5,6 +5,9 @@ use tokio::time;
 
 use crate::nvml::NvmlSession;
 
+/// No observed device for a layer; never use this as a telemetry index.
+pub const UNKNOWN_GPU: usize = usize::MAX;
+
 /// Statistics for a single GPU
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
