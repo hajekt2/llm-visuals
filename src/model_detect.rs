@@ -43,13 +43,13 @@ impl std::fmt::Display for DetectedModel {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        if self.engine == "strata" {
+        if self.engine == "strata" && self.pid == 0 {
             return write!(
                 f,
                 "{} ({}:{} · strata)",
                 self.name,
                 self.host,
-                self.port.unwrap_or(8080)
+                self.port.unwrap_or(crate::strata::DEFAULT_PORT)
             );
         }
         if self.pid == 0 {
@@ -437,7 +437,9 @@ fn resolve_container_host_port(
     if server == own {
         return cmdline_port.or(Some(default_port));
     }
-    let ips = netns_ipv4s(pid)?;
+    let Some(ips) = netns_ipv4s(pid) else {
+        return cmdline_port.or(Some(default_port));
+    };
     if ips.is_empty() {
         return cmdline_port;
     }
@@ -561,19 +563,18 @@ pub fn detect_models() -> Vec<DetectedModel> {
     }
     let mut by_pid: std::collections::HashMap<u32, DetectedModel> =
         std::collections::HashMap::new();
-    // SGLang workers hold the GPU memory; fold it onto the launcher PID.
+    // SGLang workers and Strata's native child hold GPU memory. Fold
+    // each card's compute-app allocation onto the HTTP launcher PID.
     let mut worker_gpu: std::collections::HashMap<u32, (u64, Vec<u32>)> =
         std::collections::HashMap::new();
 
     for app in gpu_procs {
         let cmdline = read_cmdline(app.pid).unwrap_or_else(|| app.process_name.clone());
-        if is_sglang_worker(&app.process_name) {
+        if is_sglang_worker(&app.process_name)
+            || crate::strata::is_engine(&app.process_name, &cmdline)
+        {
             if let Some(ppid) = parent_pid(app.pid) {
-                let e = worker_gpu.entry(ppid).or_insert((0, Vec::new()));
-                e.0 = e.0.saturating_add(app.mem_used_mb);
-                if !e.1.contains(&app.gpu_index) {
-                    e.1.push(app.gpu_index);
-                }
+                record_worker_gpu(&mut worker_gpu, ppid, &app);
             }
             continue;
         }
@@ -589,6 +590,11 @@ pub fn detect_models() -> Vec<DetectedModel> {
         }
         if parsed.engine == "sglang" {
             parsed.port = resolve_container_host_port(app.pid, parsed.port, 30000);
+        }
+        if parsed.engine == "strata" {
+            parsed.port =
+                resolve_container_host_port(app.pid, parsed.port, crate::strata::DEFAULT_PORT);
+            parsed.host = container_connect_host(app.pid, &parsed.host);
         }
         let entry = by_pid.entry(app.pid).or_insert_with(|| DetectedModel {
             name: parsed.name.clone(),
@@ -629,7 +635,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
         if parsed.engine == "vllm" && is_vllm_phantom(&name, &cmdline) {
             continue;
         }
-        if is_sglang_worker(&name) {
+        if is_sglang_worker(&name) || crate::strata::is_engine(&name, &cmdline) {
             continue;
         }
         // A vLLM server in a container reports its internal port;
@@ -639,6 +645,11 @@ pub fn detect_models() -> Vec<DetectedModel> {
         }
         if parsed.engine == "sglang" {
             parsed.port = resolve_container_host_port(pid, parsed.port, 30000);
+        }
+        if parsed.engine == "strata" {
+            parsed.port =
+                resolve_container_host_port(pid, parsed.port, crate::strata::DEFAULT_PORT);
+            parsed.host = container_connect_host(pid, &parsed.host);
         }
         by_pid.insert(
             pid,
@@ -688,6 +699,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
 
     let mut models: Vec<DetectedModel> = by_pid.into_values().collect();
     for m in &mut models {
+        if m.engine == "strata" {
+            apply_strata_config(m);
+        }
         if let Some(path) = m.path.clone() {
             // A containerized server reports the model path as seen from
             // its own mount namespace (e.g. /model); re-anchor it through
@@ -740,6 +754,59 @@ pub fn detect_models() -> Vec<DetectedModel> {
     models
 }
 
+/// Prefer the server's mount namespace even if the same path exists locally.
+/// In particular, a relative --config is relative to the *server*, not us.
+fn process_file(pid: u32, path: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if pid > 0 {
+        return if path.is_absolute() {
+            PathBuf::from(format!("/proc/{pid}/root")).join(path.strip_prefix("/").unwrap_or(path))
+        } else {
+            PathBuf::from(format!("/proc/{pid}/cwd")).join(path)
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    if path.is_relative() {
+        if let Some(cwd) = process_cwd(pid) {
+            return cwd.join(path);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn apply_strata_config(m: &mut DetectedModel) {
+    let Some(path) = crate::strata::config_path(&m.cmdline, None) else {
+        return;
+    };
+    let Some(cfg) = std::fs::read_to_string(process_file(m.pid, &path))
+        .ok()
+        .and_then(|body| crate::strata::parse_config(&body))
+    else {
+        return;
+    };
+    if let Some(name) = cfg.model_name {
+        m.name = name;
+    }
+    if m.path.is_none() {
+        m.path = cfg.gguf.map(|p| process_file(m.pid, &p));
+    }
+    if m.ctx_max.is_none() {
+        m.ctx_max = cfg.max_context;
+    }
+}
+
+/// A container's specific bind IP cannot be dialled at its published host port.
+/// Keep a real host bind (host-network containers), but dial loopback for bridge NAT.
+fn container_connect_host(pid: u32, host: &str) -> String {
+    let own = std::fs::read_link("/proc/self/ns/net").ok();
+    let server = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+    if own.is_some() && server.is_some() && own != server {
+        "127.0.0.1".into()
+    } else {
+        host.into()
+    }
+}
+
 /// This dashboard is itself a process with `--model` on its command line;
 /// without this it would list itself as a running LLM.
 fn is_self(pid: u32, cmdline: &str) -> bool {
@@ -760,7 +827,16 @@ struct ParsedCmd {
 }
 
 fn is_strata_server(cmdline: &str) -> bool {
-    crate::sglang::cmdline_flag(cmdline, "--engine").as_deref() == Some("strata")
+    let argv0 = cmdline
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .replace('\\', "/");
+    let base = argv0.rsplit('/').next().unwrap_or("");
+    // Docker clients, shells and monitoring wrappers merely mention a server
+    // in their arguments. The Python launcher is the HTTP owner.
+    (base.starts_with("python") || base == "server.py")
+        && crate::sglang::cmdline_flag(cmdline, "--engine").as_deref() == Some("strata")
         && cmdline
             .split_whitespace()
             .any(|t| t == "serve.server" || t.replace('\\', "/").ends_with("serve/server.py"))
@@ -1089,7 +1165,7 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
         parsed.tensor_split.clear();
     }
     if parsed.port.is_none() && parsed.engine == "strata" {
-        parsed.port = Some(8080);
+        parsed.port = Some(crate::strata::DEFAULT_PORT);
     }
     if parsed.port.is_none() && parsed.engine == "llama.cpp" {
         parsed.port = Some(8080);
@@ -1263,6 +1339,18 @@ fn cmdline_of(p: &sysinfo::Process) -> Option<String> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     (!args.is_empty()).then(|| args.join(" "))
+}
+
+fn record_worker_gpu(
+    workers: &mut std::collections::HashMap<u32, (u64, Vec<u32>)>,
+    ppid: u32,
+    app: &ComputeApp,
+) {
+    let e = workers.entry(ppid).or_insert((0, Vec::new()));
+    e.0 = e.0.saturating_add(app.mem_used_mb);
+    if !e.1.contains(&app.gpu_index) {
+        e.1.push(app.gpu_index);
+    }
 }
 
 struct ComputeApp {
@@ -1871,7 +1959,18 @@ pub async fn probe_endpoint(
 
 /// Probe candidate local ports for running inference servers.
 pub async fn probe_local_endpoints(auth: &crate::observe::HttpAuth) -> Vec<DetectedModel> {
-    const CANDIDATES: &[u16] = &[7000, 8000, 8080, 11434, 30000, 5000, 8001, 8081, 7001];
+    const CANDIDATES: &[u16] = &[
+        7000,
+        8000,
+        8080,
+        11434,
+        30000,
+        5000,
+        8001,
+        8081,
+        7001,
+        crate::strata::DEFAULT_PORT,
+    ];
     // A server bound to a LAN address never accepts a loopback connection.
     // The process scan reads `--host` when it can see the command line;
     // this probe covers the case where it cannot (another user, a container
@@ -1908,6 +2007,22 @@ pub async fn probe_local_endpoints(auth: &crate::observe::HttpAuth) -> Vec<Detec
     models
 }
 
+/// Endpoint identity must not attach a remote model to unrelated local GPUs.
+/// Local LAN literals and loopback aliases can still identify the same server.
+pub fn is_local_host(host: &str) -> bool {
+    let bare = host.trim_matches(['[', ']']);
+    if bare.eq_ignore_ascii_case("localhost") || matches!(bare, "0.0.0.0" | "::")
+        || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ips) = netns_ipv4s(std::process::id()) {
+        return ips.iter().any(|ip| ip == bare);
+    }
+    false
+}
+
 fn probe_hosts() -> Vec<String> {
     #[allow(unused_mut)]
     let mut hosts = vec!["127.0.0.1".to_string()];
@@ -1937,6 +2052,18 @@ fn extra_probe_ips(ips: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_endpoint_identity_does_not_match_remote_hosts() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("[::1]"));
+        assert!(!is_local_host("192.0.2.42"));
+        #[cfg(target_os = "linux")]
+        for ip in netns_ipv4s(std::process::id()).unwrap_or_default() {
+            assert!(is_local_host(&ip));
+        }
+    }
 
     #[test]
     fn gpu_affinity_from_environ() {
@@ -2299,6 +2426,54 @@ mod tests {
     }
 
     #[test]
+    fn strata_engine_memory_folds_across_cards() {
+        let mut workers = std::collections::HashMap::new();
+        for (gpu_index, mem_used_mb) in [(0, 1000), (1, 2000)] {
+            record_worker_gpu(
+                &mut workers,
+                42,
+                &ComputeApp {
+                    pid: 43,
+                    process_name: "strata".into(),
+                    gpu_index,
+                    mem_used_mb,
+                },
+            );
+        }
+        assert_eq!(workers[&42], (3000, vec![0, 1]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strata_config_uses_process_mount_namespace_and_cwd() {
+        let pid = std::process::id();
+        let path = Path::new("fixtures/strata-config.json");
+        assert_eq!(
+            process_file(pid, path),
+            PathBuf::from(format!("/proc/{pid}/cwd/fixtures/strata-config.json"))
+        );
+        let absolute = std::env::current_dir().unwrap().join(path);
+        assert!(process_file(pid, &absolute).starts_with(format!("/proc/{pid}/root")));
+        let snapshot =
+            crate::strata::parse_metrics(include_str!("../fixtures/strata-idle.json")).unwrap();
+        let mut m = strata_model("127.0.0.1", 8095, &snapshot);
+        m.pid = pid;
+        m.ctx_max = None;
+        m.cmdline =
+            "python serve/server.py --engine strata --config fixtures/strata-config.json".into();
+        apply_strata_config(&mut m);
+        assert_eq!(m.name, "synthetic-config-model");
+        assert_eq!(m.ctx_max, Some(32768));
+        assert_eq!(
+            m.path,
+            Some(process_file(pid, Path::new("fixtures/synthetic.gguf")))
+        );
+        m.ctx_max = Some(8192); // explicit CLI context wins
+        apply_strata_config(&mut m);
+        assert_eq!(m.ctx_max, Some(8192));
+    }
+
+    #[test]
     fn detects_only_strata_http_launcher() {
         let cmd = "python serve/server.py --engine strata --config strata-model.json --port 8098";
         assert!(looks_like_llm("python", cmd));
@@ -2307,12 +2482,18 @@ mod tests {
         assert_eq!(p.port, Some(8098));
         assert_eq!(
             parse_cmdline("python", "python -m serve.server --engine=strata").port,
-            Some(8080)
+            Some(crate::strata::DEFAULT_PORT)
         );
         assert!(is_strata_server(
             r"python C:\Strata\serve\server.py --engine strata"
         ));
         assert!(!is_strata_server("python setup.py --engine strata"));
+        assert!(!is_strata_server(
+            "docker run strata python serve/server.py --engine strata"
+        ));
+        assert!(!is_strata_server(
+            "bash -c python serve/server.py --engine strata"
+        ));
         assert!(!looks_like_llm("strata", "strata --context 262144"));
         assert!(!looks_like_llm("bash", "bash check-strata.sh"));
         let snapshot =

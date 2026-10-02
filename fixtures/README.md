@@ -19,4 +19,18 @@ and parser tests. No errors or service restarts were induced on the live server.
 Unreachable tests use a closed ephemeral loopback port. Unit tests also mutate
 small JSON samples to verify missing, renamed, negative and wrong-type fields.
 
+`strata-metrics-upstream.json` is the public pre-0.1.35 metrics fixture from
+DingoOz/llm-visuals `feature/strata`, commit `8a1492d`, retained to exercise the
+older shape with no draft fields. `strata-metrics-0.1.35.json` is **synthetic**,
+following the optional per-request and running-total counters documented in
+https://github.com/DingoOz/llm-visuals/issues/32. It includes null counters and
+zero offered. Tests mutate these samples to cover counter reset, changed
+`totals.since` (a simulated restart), missing fields and invalid counter pairs.
+No live restart or inference request was needed for those tests.
+
+`strata-config.json` is synthetic. Its nonexistent `synthetic.gguf` path tests
+path anchoring only, not loading weights. The renderer tests use synthetic GPU
+and GGUF metadata as well as real 0.1.31 metric shapes. With `STRATA_CAPTURE=1`,
+they write inspectable text layouts into `target/strata-render-*.txt`.
+
 The existing SGLang/vLLM/XPU fixtures retain their original provenance.

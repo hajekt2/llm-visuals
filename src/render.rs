@@ -162,7 +162,7 @@ impl Renderer {
         if bar_h > 0 {
             self.render_models_bar(frame, rows[1], d);
         }
-        if d.detected.is_some_and(|m| m.engine == "strata") {
+        if d.detected.is_some_and(|m| m.engine == "strata") && d.view != ViewMode::Models {
             self.render_strata(frame, rows[2], d);
         } else {
             match d.view {
@@ -174,8 +174,8 @@ impl Renderer {
         self.render_footer(frame, rows[3], d);
     }
 
-    /// Strata has cache/settings facts, not layer placement or expert routing.
-    /// Its hardware is sampled on the server, never from the dashboard host.
+    /// Keep Strata's measured rates and request log, but share context/spec and
+    /// local GPU panels with the other engines. Never use local GPUs remotely.
     fn render_strata(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let Some(m) = &d.live.strata else {
             strata_panel(
@@ -189,12 +189,38 @@ impl Renderer {
             );
             return;
         };
+        if matches!(d.view, ViewMode::Heatmap | ViewMode::MoE) {
+            self.render_strata_architecture(frame, area, d, m);
+            return;
+        }
+        if d.view == ViewMode::Bandwidth {
+            strata_panel(
+                frame,
+                area,
+                " ◆ STRATA · BANDWIDTH ",
+                vec![
+                    "Per-layer weight placement and verification steps are not reported.".into(),
+                    format!(
+                        "Measured PCIe RX {} · TX {} MiB/s",
+                        strata_num(&m.hardware, "gpu_pcie_rx_mb", 1),
+                        strata_num(&m.hardware, "gpu_pcie_tx_mb", 1)
+                    ),
+                ],
+            );
+            return;
+        }
+        let engine_h = if d.view == ViewMode::Perf || area.height < 34 {
+            0
+        } else {
+            10
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(if area.height >= 34 { 12 } else { 9 }),
-                Constraint::Length(if area.height >= 34 { 12 } else { 9 }),
-                Constraint::Min(3),
+                Constraint::Min(10),
+                Constraint::Length(4),
+                Constraint::Length(engine_h),
+                Constraint::Length(if area.height >= 34 { 9 } else { 6 }),
             ])
             .split(area);
         let top = Layout::default()
@@ -202,9 +228,65 @@ impl Renderer {
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(rows[0]);
         self.render_throughput(frame, top[0], d);
-        self.render_strata_hardware(frame, top[1], m);
-        self.render_strata_engine(frame, rows[1], m);
-        self.render_strata_requests(frame, rows[2], m);
+        if d.detected.is_some_and(|model| model.pid != 0) {
+            self.render_gpus(frame, top[1], d);
+        } else {
+            self.render_strata_hardware(frame, top[1], m);
+        }
+        let context = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[1]);
+        self.render_context(frame, context[0], d);
+        self.render_spec(frame, context[1], d);
+        if engine_h > 0 {
+            self.render_strata_engine(frame, rows[2], m);
+        }
+        self.render_strata_requests(frame, rows[3], m);
+    }
+
+    fn render_strata_architecture(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        d: &Dashboard,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let mut lines = vec![];
+        if let Some(g) = d.detected.and_then(|model| model.gguf.as_ref()) {
+            lines.push(format!(
+                "{} · {} layers × {} heads · {} KV heads",
+                g.architecture, g.n_layers, g.n_heads, g.n_kv_heads
+            ));
+            lines.push(format!(
+                "MoE {} of {} experts per token · MTP layers {}",
+                g.n_experts_used, g.n_experts, g.n_mtp
+            ));
+            if let Some(e) = &g.engram {
+                lines.push(format!("engram {}-gram", e.ngram_size));
+            }
+        } else {
+            lines
+                .push("Architecture unavailable: GGUF header is not readable on this host.".into());
+        }
+        lines.push(format!(
+            "Expert cache {} MiB / {} slots · last hit {}%",
+            strata_num(&m.engine, "expert_cache_mib", 0),
+            strata_num(&m.engine, "expert_slots", 0),
+            strata_scaled(
+                m.requests.first().unwrap_or(&serde_json::Value::Null),
+                "hit_rate",
+                100.0,
+                1
+            )
+        ));
+        lines.push("Strata does not report layer placement, attention or expert routing.".into());
+        strata_panel(
+            frame,
+            area,
+            " ◆ STRATA · LAYERS / EXPERTS · metadata only ",
+            lines,
+        );
     }
 
     fn render_strata_hardware(
@@ -263,6 +345,58 @@ impl Renderer {
                 ),
             ],
         );
+        // These are server-side histories, not local GPU/RAM samples.
+        if area.height >= 14 && area.width >= 30 {
+            let charts = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(Rect::new(
+                    area.x + 1,
+                    area.y + 9,
+                    area.width.saturating_sub(2),
+                    area.height - 10,
+                ));
+            for (chart, key, label, scale) in [
+                (charts[0], "gpu_util", "GPU utilization", Some(100.0)),
+                (
+                    charts[1],
+                    "ram_used",
+                    "SYSTEM RAM",
+                    crate::strata::number(h, "ram_total"),
+                ),
+            ] {
+                let values: Vec<f32> = m
+                    .history
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_f64())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| v as f32)
+                    .collect();
+                let mut lines = vec![Line::from(Span::styled(
+                    label,
+                    Style::default().fg(pal::c(pal::TEAL)),
+                ))];
+                if let Some(scale) = scale.filter(|n| *n > 0.0) {
+                    if !values.is_empty() {
+                        lines.extend(
+                            sparkline(
+                                &values,
+                                chart.width as usize,
+                                chart.height.saturating_sub(1) as usize,
+                                scale as f32,
+                                pal::FLOW,
+                            )
+                            .into_iter()
+                            .map(Line::from),
+                        );
+                    }
+                }
+                frame.render_widget(Paragraph::new(lines), chart);
+            }
+        }
     }
 
     fn render_strata_engine(
@@ -314,7 +448,7 @@ impl Renderer {
                 strata_num(e, "expert_slots", 0)
             ),
             format!(
-                "Spec {} · MTP max {} · lookup {} · acceptance unavailable",
+                "Spec {} · MTP max {} · lookup {} · acceptance in SPECULATIVE panel",
                 strata_num(e, "spec", 0),
                 strata_num(e, "mtp_max", 0),
                 strata_num(e, "lookup", 0)
@@ -374,9 +508,11 @@ impl Renderer {
         m: &crate::strata::StrataMetrics,
     ) {
         let wide = area.width >= 120;
-        let mut heading = "finish     prompt   reused   output   pre t/s   dec t/s  prompt s  total s   hit%   file MB".to_string();
+        let mut heading =
+            "finish     prompt   reused   output   pre t/s   dec t/s  prompt s  accept%"
+                .to_string();
         if wide {
-            heading.push_str("   RAM/file blobs");
+            heading.push_str("  total s   hit%   file MB   RAM/file blobs");
         }
         let mut lines = vec![heading];
         for r in &m.requests {
@@ -386,7 +522,7 @@ impl Renderer {
                 .map(|((p, reused), ms)| format!("{:.1}", (p - reused).max(0.0) * 1000.0 / ms))
                 .unwrap_or_else(|| "—".into());
             let mut row = format!(
-                "{:<8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>8} {:>6} {:>9}",
+                "{:<8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>8}",
                 strata_text(r, "finish"),
                 strata_num(r, "prompt_tokens", 0),
                 strata_num(r, "reused", 0),
@@ -394,13 +530,16 @@ impl Renderer {
                 pre,
                 strata_num(r, "decode_tok_s", 1),
                 strata_scaled(r, "prompt_ms", 0.001, 2),
-                strata_num(r, "duration_s", 1),
-                strata_scaled(r, "hit_rate", 100.0, 1),
-                strata_num(r, "file_mb", 1)
+                crate::strata::draft_acceptance(r)
+                    .map(|n| format!("{:.1}", n * 100.0))
+                    .unwrap_or_else(|| "—".into())
             );
             if wide {
                 row.push_str(&format!(
-                    "   {}/{}",
+                    "  {:>7} {:>6} {:>9}   {}/{}",
+                    strata_num(r, "duration_s", 1),
+                    strata_scaled(r, "hit_rate", 100.0, 1),
+                    strata_num(r, "file_mb", 1),
                     strata_num(r, "ram_blobs", 0),
                     strata_num(r, "file_blobs", 0)
                 ));
@@ -662,6 +801,22 @@ impl Renderer {
                         seg.push(Span::styled(format!(" ({dev})"), st(pal::TEXT_DIM)));
                     }
                     segs.push((9, seg));
+                } else if m.engine == "strata"
+                    && d.live.strata.as_ref().is_some_and(|metrics| {
+                        metrics
+                            .engine
+                            .get("images")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+                {
+                    segs.push((
+                        9,
+                        vec![Span::styled(
+                            "vision support (placement unknown)",
+                            st(pal::MAGENTA),
+                        )],
+                    ));
                 }
                 if let Some(q) = quant_from_path(m) {
                     segs.push((2, vec![Span::styled(q, st(pal::TEAL))]));
@@ -1107,8 +1262,19 @@ impl Renderer {
                 .get(gi)
                 .copied()
                 .unwrap_or(g.vram_percent() / 100.0);
-            let weights = d.fade.weight_frac.get(gi).copied().unwrap_or(0.0).min(used);
-            let kv = d.fade.kv_alloc_frac.get(gi).copied().unwrap_or(0.0);
+            let strata = d.detected.is_some_and(|m| m.engine == "strata");
+            // Strata's GGUF file includes offloaded experts, so file size is
+            // not GPU weight residency, nor is the remainder necessarily KV.
+            let weights = if strata {
+                0.0
+            } else {
+                d.fade.weight_frac.get(gi).copied().unwrap_or(0.0).min(used)
+            };
+            let kv = if strata {
+                0.0
+            } else {
+                d.fade.kv_alloc_frac.get(gi).copied().unwrap_or(0.0)
+            };
             let kv_fill = d.fade.kv_frac;
             let label = format!("{:<12}", "   VRAM");
             let txt = format!(" {:>4.1}/{:<4.1}G ", g.vram_gb(), g.vram_total_gb());
@@ -1199,7 +1365,12 @@ impl Renderer {
                             )
                         })
                 };
-                if let Some((wt, kt)) = wk {
+                if strata {
+                    spans.push(Span::styled(
+                        " weights/KV unknown",
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    ));
+                } else if let Some((wt, kt)) = wk {
                     spans.push(Span::styled("■", Style::default().fg(pal::c(pal::BLUE))));
                     spans.push(Span::styled(
                         format!(" w {:.1}G ", wt * g.vram_total_gb()),
@@ -1351,6 +1522,19 @@ impl Renderer {
     // -----------------------------------------------------------------------
 
     fn render_context(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        if d.live
+            .strata
+            .as_ref()
+            .is_some_and(|m| m.context_used().is_none() || m.context_max().is_none())
+        {
+            strata_panel(
+                frame,
+                area,
+                " ◆ CONTEXT ",
+                vec!["Context not reported by Strata".into()],
+            );
+            return;
+        }
         let f = d.fade;
         let ctx_max = f.ctx_max.max(1);
         let used = f.ctx_used.min(ctx_max);
@@ -1567,7 +1751,10 @@ impl Renderer {
             .unwrap_or(0);
         let enabled = !spec_type.is_empty() && spec_type != "none";
         let mtp = spec_type.to_ascii_lowercase().contains("mtp");
-        let title = if !enabled {
+        let is_strata = d.detected.is_some_and(|m| m.engine == "strata");
+        let title = if is_strata {
+            format!(" ◆ SPECULATIVE  {spec_type} · depth {depth} ")
+        } else if !enabled {
             " ◆ MTP  no speculative decoding ".to_string()
         } else if mtp && depth > 0 {
             format!(" ◆ MTP  {spec_type} · depth {depth} ")
@@ -1586,6 +1773,14 @@ impl Renderer {
         let h = inner.height as usize;
         let mut lines: Vec<Line> = Vec::with_capacity(h);
 
+        if is_strata && !sp.available {
+            lines.push(Line::from(Span::styled(
+                truncate("Strata does not report draft acceptance", w),
+                Style::default().fg(pal::c(pal::AMBER)),
+            )));
+            frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+            return;
+        }
         if !enabled {
             lines.push(Line::from(Span::styled(
                 "the server is not drafting tokens — nothing to accept or reject",
@@ -1626,14 +1821,20 @@ impl Renderer {
 
         // Line 1: windowed acceptance gauge + mean accepted length + step rate.
         let live = sp.drafts_per_sec > 0.0;
-        let rate_txt = format!(" {:>3.0}%", sp.accept_rate * 100.0);
+        let rate_txt = if is_strata && sp.drafts_per_sec == 0.0 {
+            "   — ".into()
+        } else {
+            format!(" {:>3.0}%", sp.accept_rate * 100.0)
+        };
         let label = "accept ";
         let long_tail = format!(
             "  {:.2} tok/step  {:.0} steps/s",
             1.0 + sp.mean_accepted,
             sp.steps_per_sec
         );
-        let tail = if label.len() + rate_txt.len() + long_tail.len() + 12 <= w {
+        let tail = if is_strata {
+            "  finished requests".into()
+        } else if label.len() + rate_txt.len() + long_tail.len() + 12 <= w {
             long_tail
         } else {
             format!("  {:.2}/step", 1.0 + sp.mean_accepted)
@@ -1667,13 +1868,26 @@ impl Renderer {
         if rows > 0 {
             let hist: Vec<f32> = sp.accept_hist.iter().copied().collect();
             let label_w = 7;
-            let session = format!(
-                "  session {:.0}% · {}/{} · {:.0}% of output",
-                sp.session_accept_rate() * 100.0,
-                fmt_int(sp.totals.accepted as usize),
-                fmt_int(sp.totals.draft_tokens as usize),
-                sp.session_draft_share() * 100.0
-            );
+            let session = if is_strata {
+                format!(
+                    "  total {} · {}/{}",
+                    if sp.totals.draft_tokens > 0 {
+                        format!("{:.0}%", sp.session_accept_rate() * 100.0)
+                    } else {
+                        "—".into()
+                    },
+                    fmt_int(sp.totals.accepted as usize),
+                    fmt_int(sp.totals.draft_tokens as usize)
+                )
+            } else {
+                format!(
+                    "  session {:.0}% · {}/{} · {:.0}% of output",
+                    sp.session_accept_rate() * 100.0,
+                    fmt_int(sp.totals.accepted as usize),
+                    fmt_int(sp.totals.draft_tokens as usize),
+                    sp.session_draft_share() * 100.0
+                )
+            };
             let beside = w >= label_w + 24 + session.len();
             let own_line = !beside && rows >= 3;
             let session_w = if beside { session.len() } else { 0 };
@@ -2976,7 +3190,7 @@ impl Renderer {
         }
 
         if show_vram {
-            let vram = if m.detected.engine == "strata" {
+            let vram = if m.detected.engine == "strata" && m.detected.pid == 0 {
                 "—".to_string() // Strata does not report per-process VRAM
             } else {
                 format!("{:.1}", m.detected.mem_used_mb as f32 / 1024.0)
@@ -4595,6 +4809,7 @@ mod tests {
                 ViewMode::All,
                 ViewMode::Perf,
                 ViewMode::MoE,
+                ViewMode::Heatmap,
                 ViewMode::Bandwidth,
             ] {
                 let metrics =
@@ -4605,6 +4820,8 @@ mod tests {
                 perf.observe(&live, Instant::now());
                 let mut model = crate::demo::demo_models(262144, 1).remove(0);
                 model.engine = "strata".into();
+                model.pid = 0;
+                model.gguf = None;
                 let fade = FadeState::new();
                 let attention = TokenBuffer::new(10);
                 let generated = GeneratedText::new();
@@ -4643,12 +4860,149 @@ mod tests {
                     .collect();
                 assert!(!output.contains("simulated"));
                 if width >= 100 {
-                    assert!(output.contains("NVIDIA GeForce RTX 3090"));
-                    assert!(output.contains("expert cache 13517 MiB / 6958 slots"));
-                    assert!(output.contains("acceptance unavailable"));
-                    assert!(output.contains("TTFT unavailable"));
-                    assert!(output.contains("parked count unavailable"));
+                    match view {
+                        ViewMode::All | ViewMode::Perf => {
+                            assert!(output.contains("NVIDIA GeForce RTX 3090"));
+                            assert!(output.contains("CONTEXT"));
+                            assert!(output.contains("SPECULATIVE"));
+                            assert!(output.contains("Strata does not report draft acceptance"));
+                            assert!(output.contains("accept%"));
+                            if width == 150 && view == ViewMode::All {
+                                assert!(output.contains("expert cache 13517 MiB / 6958 slots"));
+                                assert!(output.contains("parked count unavailable"));
+                            }
+                        }
+                        ViewMode::Heatmap | ViewMode::MoE => {
+                            assert!(output.contains("GGUF header is not readable"));
+                            assert!(output.contains("does not report layer placement"));
+                        }
+                        ViewMode::Bandwidth => assert!(output.contains("Measured PCIe RX")),
+                        _ => unreachable!(),
+                    }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn strata_modern_acceptance_and_local_gpu_panels() {
+        use ratatui::backend::TestBackend;
+        for pid in [0, 42] {
+            let mut metrics = crate::strata::parse_metrics(include_str!(
+                "../fixtures/strata-metrics-0.1.35.json"
+            ))
+            .unwrap();
+            if pid == 0 {
+                metrics.engine["images"] = true.into();
+            }
+            let live = crate::strata::StrataAdapter::default().observe(metrics);
+            let mut perf = PerfTracker::new();
+            perf.observe(&live, Instant::now());
+            let mut model = crate::demo::demo_models(262144, 1).remove(0);
+            model.engine = "strata".into();
+            model.pid = pid;
+            if pid == 0 {
+                model.gguf = None;
+                model.vision = None;
+                model.path = None;
+            }
+            let mut fade = FadeState::new();
+            fade.ctx_max = live.ctx_max;
+            fade.ctx_used = live.ctx_used();
+            let attention = TokenBuffer::new(10);
+            let generated = GeneratedText::new();
+            let gpus = vec![
+                crate::gpu::DemoGpu::new(0).step(0.5),
+                crate::gpu::DemoGpu::new(1).step(0.5),
+            ];
+            let second = crate::demo::demo_models(262144, 2).remove(1);
+            let views = vec![
+                ModelView {
+                    detected: &model,
+                    perf: &perf,
+                    live: &live,
+                    fade: &fade,
+                    experts: None,
+                    num_layers: model.n_layers(),
+                    num_heads: model.n_heads(),
+                },
+                ModelView {
+                    detected: &second,
+                    perf: &perf,
+                    live: &live,
+                    fade: &fade,
+                    experts: None,
+                    num_layers: second.n_layers(),
+                    num_heads: second.n_heads(),
+                },
+            ];
+            let d = Dashboard {
+                models: &views,
+                focus: 0,
+                detected: Some(&model),
+                gpus: &gpus,
+                gpu_error: None,
+                fade: &fade,
+                perf: &perf,
+                live: &live,
+                attention: &attention,
+                generated: &generated,
+                num_layers: model.n_layers(),
+                num_heads: model.n_heads(),
+                view: ViewMode::Perf,
+                status: "",
+                theme_name: "defrag",
+                demo: false,
+                experts: None,
+                gpu_backend: Some("demo"),
+                settings: None,
+                log: None,
+                ctx_speed: None,
+            };
+            let r = Renderer::new(pal::defrag_theme(), 0, 0, 0);
+            let mut terminal = Terminal::new(TestBackend::new(150, 46)).unwrap();
+            terminal.draw(|f| r.render_view(f, f.area(), &d)).unwrap();
+            let output: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(output.contains("MODELS  2"));
+            assert!(output.contains(&second.short_name()));
+            assert!(output.contains("729/828"));
+            assert!(output.contains("88%"));
+            assert!(output.contains("accept%"));
+            assert!(output.contains("88.0"));
+            assert!(!output.contains("tok/step"));
+            assert!(!output.contains("steps/s"));
+            assert!(!output.contains("does not report draft acceptance"));
+            if pid > 0 {
+                assert!(output.contains("strata pid 42"));
+                assert!(output.contains("41L × 16H"));
+                assert!(output.contains("MoE 8/256"));
+                assert!(output.contains("GPUS"));
+                assert!(output.contains("weights/KV unknown"));
+                assert!(!output.contains("SERVER HARDWARE"));
+            } else {
+                assert!(output.contains("SERVER HARDWARE"));
+                assert!(!output.contains("weights/KV unknown"));
+                assert!(!output.contains("41L × 16H"));
+                assert!(!output.contains("vision G0"));
+                assert!(output.contains("vision support (placement unknown)"));
+            }
+            // Inspectable text captures without changing tracked snapshots.
+            if std::env::var_os("STRATA_CAPTURE").is_some() {
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(150)
+                    .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(format!("target/strata-render-{pid}.txt"), text).unwrap();
             }
         }
     }

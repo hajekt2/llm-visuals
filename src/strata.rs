@@ -2,6 +2,10 @@
 //! windowed by the server. Preserve unknown fields as unknown, not real zeroes.
 use crate::observe::{http_get, HttpAuth, LiveStats};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// Strata HTTP default, not llama.cpp's 8080.
+pub const DEFAULT_PORT: u16 = 8095;
 
 #[derive(Debug, Clone, Default)]
 pub struct StrataMetrics {
@@ -11,12 +15,26 @@ pub struct StrataMetrics {
     pub hardware: Value,
     pub hardware_static: Value,
     pub requests: Vec<Value>,
+    pub history: Value,
 }
 
 /// Numeric fields can disappear or become null between engine versions.
 /// Reject negative/non-finite values and strings rather than inventing data.
 pub fn number(v: &Value, key: &str) -> Option<f64> {
     v.get(key)?.as_f64().filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+/// 0.1.35 counts are optional (including explicit null), never estimated.
+/// A zero denominator is reported but has no defined acceptance percentage.
+pub fn draft_counts(v: &Value) -> Option<(u64, u64)> {
+    let offered = v.get("drafts_offered")?.as_u64()?;
+    let accepted = v.get("drafts_accepted")?.as_u64()?;
+    (accepted <= offered).then_some((offered, accepted))
+}
+
+pub fn draft_acceptance(v: &Value) -> Option<f32> {
+    let (offered, accepted) = draft_counts(v)?;
+    (offered > 0).then(|| accepted as f32 / offered as f32)
 }
 
 pub fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -40,6 +58,7 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
         totals: v.get("totals").cloned().unwrap_or_default(),
         hardware: v.get("hardware").cloned().unwrap_or_default(),
         hardware_static: v.get("hardware_static").cloned().unwrap_or_default(),
+        history: v.get("history").cloned().unwrap_or_default(),
         requests: v
             .get("requests")
             .and_then(Value::as_array)
@@ -134,8 +153,16 @@ impl StrataAdapter {
             // Progress includes a reused prefix; it is NOT newly computed
             // prefill. Use Strata's measured prefill rate instead of deltas.
             prompt_processed: 0,
-            decoded: if processing { generated } else { 0 },
-            decoded_present: number(&m.live, "generated").is_some(),
+            decoded: if processing {
+                generated
+            } else {
+                number(source, "output_tokens").unwrap_or(0.0) as usize
+            },
+            decoded_present: if processing {
+                number(&m.live, "generated").is_some()
+            } else {
+                number(source, "output_tokens").is_some()
+            },
             cache_tokens: if processing {
                 0
             } else {
@@ -143,12 +170,77 @@ impl StrataAdapter {
             },
             cache_unknown: processing || number(source, "reused").is_none(),
             processing,
+            n_slots: 1,
+            slots_busy: usize::from(processing),
+            spec_types: if number(&m.engine, "spec").is_some_and(|n| n > 0.0) {
+                if number(&m.engine, "mtp_max").is_some_and(|n| n > 0.0) {
+                    "mtp".into()
+                } else {
+                    "lookup".into()
+                }
+            } else {
+                "none".into()
+            },
+            spec_depth: number(&m.engine, "mtp_max").unwrap_or(0.0) as usize,
             id_task: self.task,
             kv_tokens: m.context_used(),
             strata: Some(m),
             ..Default::default()
         }
     }
+}
+
+/// The native `strata --serve` child. It holds the GPU memory but speaks
+/// only to its parent over a pipe, so it is folded into the server.
+pub fn is_engine(process_name: &str, cmdline: &str) -> bool {
+    let argv0 = cmdline.split_whitespace().next().unwrap_or(process_name);
+    let base = Path::new(argv0)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    (base == "strata" || base == "strata.exe") && cmdline.split_whitespace().any(|t| t == "--serve")
+}
+
+/// What the server's `--config` JSON says about the model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StrataConfig {
+    pub model_name: Option<String>,
+    /// First GGUF shard (`--native`), which carries the header.
+    pub gguf: Option<PathBuf>,
+    pub max_context: Option<usize>,
+}
+
+pub fn parse_config(body: &str) -> Option<StrataConfig> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let args: Vec<&str> = v
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let flag = |name: &str| {
+        args.iter().enumerate().find_map(|(i, a)| {
+            a.strip_prefix(&format!("{name}="))
+                .or_else(|| (*a == name).then(|| args.get(i + 1).copied()).flatten())
+                .map(str::to_string)
+        })
+    };
+    Some(StrataConfig {
+        model_name: v
+            .get("model_name")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        gguf: flag("--native").map(PathBuf::from),
+        max_context: flag("--max-context").and_then(|s| s.parse().ok()),
+    })
+}
+
+/// The `--config` path on a server command line, resolved against `cwd`.
+pub fn config_path(cmdline: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let p = PathBuf::from(crate::sglang::cmdline_flag(cmdline, "--config")?);
+    Some(match cwd {
+        Some(dir) if p.is_relative() => dir.join(p),
+        _ => p,
+    })
 }
 
 #[cfg(test)]
@@ -250,6 +342,100 @@ mod tests {
         ] {
             assert!(parse_metrics(body).is_none(), "{body}");
         }
+    }
+
+    #[test]
+    fn acceptance_optional_and_windowed_across_restarts() {
+        use crate::perf::PerfTracker;
+        use std::time::{Duration, Instant};
+        let modern = parse_metrics(include_str!("../fixtures/strata-metrics-0.1.35.json")).unwrap();
+        assert!((draft_acceptance(&modern.requests[0]).unwrap() - 641.0 / 728.0).abs() < 1e-6);
+        assert!(draft_acceptance(&modern.requests[2]).is_none());
+        assert_eq!(draft_counts(&modern.requests[3]), Some((0, 0)));
+        assert!(draft_acceptance(&modern.requests[3]).is_none());
+        for v in [
+            serde_json::json!({"drafts_offered": 1, "drafts_accepted": 2}),
+            serde_json::json!({"drafts_offered": null, "drafts_accepted": 0}),
+            serde_json::json!({"drafts_offered": -1, "drafts_accepted": 0}),
+        ] {
+            assert!(draft_counts(&v).is_none());
+        }
+        let mut baseline = modern.clone();
+        baseline.totals = serde_json::json!({"since":1000,"requests":1,"output_tokens":100,"drafts_offered":100,"drafts_accepted":88});
+        let mut a = StrataAdapter::default();
+        let mut p = PerfTracker::new();
+        let now = Instant::now();
+        p.observe(&a.observe(baseline), now);
+        assert!(p.spec.available);
+        assert_eq!(p.spec.drafts_per_sec, 0.0); // initial sums aren't window deltas
+        p.observe(&a.observe(modern.clone()), now + Duration::from_millis(400));
+        assert!((p.spec.accept_rate - 641.0 / 728.0).abs() < 1e-6);
+        assert_eq!(p.spec.totals.accepted, 729);
+        assert_eq!(p.spec.totals.verify_steps, 0); // not inferable
+        p.observe(&a.observe(modern.clone()), now + Duration::from_secs(3));
+        assert_eq!(p.spec.drafts_per_sec, 0.0); // quiet window expires
+
+        let mut reset = modern.clone();
+        reset.totals["drafts_offered"] = 0.into();
+        reset.totals["drafts_accepted"] = 0.into();
+        p.observe(&a.observe(reset.clone()), now + Duration::from_secs(4));
+        assert_eq!(p.spec.accept_rate, 0.0);
+        assert!(p.spec.accept_hist.is_empty());
+        reset.totals["drafts_offered"] = 10.into();
+        reset.totals["drafts_accepted"] = 5.into();
+        p.observe(&a.observe(reset), now + Duration::from_millis(4400));
+        assert_eq!(p.spec.accept_rate, 0.5);
+        // A changed server start time resets even if sums increased across
+        // the restart (counter decrease alone doesn't detect that case).
+        let mut restarted = modern.clone();
+        restarted.totals["since"] = 2000.into();
+        p.observe(&a.observe(restarted), now + Duration::from_secs(5));
+        assert_eq!(p.spec.drafts_per_sec, 0.0);
+        assert!(p.spec.accept_hist.is_empty());
+        let mut null = modern;
+        null.totals["drafts_offered"] = Value::Null;
+        p.observe(&a.observe(null), now + Duration::from_secs(6));
+        assert!(!p.spec.available);
+        p.observe(&a.observe(fixture("idle")), now + Duration::from_secs(7));
+        assert!(!p.spec.available); // 0.1.31 has no fields
+    }
+
+    #[test]
+    fn upstream_older_shape_keeps_acceptance_unknown() {
+        let m = parse_metrics(include_str!("../fixtures/strata-metrics-upstream.json")).unwrap();
+        assert_eq!(m.context_max(), Some(32768));
+        assert_eq!(m.context_used(), Some(95 + 16371));
+        assert_eq!(m.decode_rate(), Some(43.9));
+        assert!(m.prefill_rate().is_none());
+        assert!(draft_counts(&m.totals).is_none());
+        assert!(draft_acceptance(&m.requests[0]).is_none());
+    }
+
+    #[test]
+    fn native_engine_and_config_facts() {
+        assert!(is_engine(
+            "strata",
+            "/opt/strata --serve --native /models/a.gguf"
+        ));
+        assert!(!is_engine("strata", "/opt/strata --bench"));
+        assert!(!is_engine(
+            "python",
+            "python serve/server.py --engine strata"
+        ));
+        let cfg = parse_config(
+            r#"{"model_name":"qwen","args":["--native=/models/a.gguf","--max-context","32768"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.gguf, Some(PathBuf::from("/models/a.gguf")));
+        assert_eq!(cfg.max_context, Some(32768));
+        assert_eq!(cfg.model_name.as_deref(), Some("qwen"));
+        assert_eq!(
+            config_path(
+                "python serve/server.py --config=a.json",
+                Some(Path::new("/srv"))
+            ),
+            Some(PathBuf::from("/srv/a.json"))
+        );
     }
 
     #[tokio::test]

@@ -111,12 +111,6 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     let mut explicit_models = Vec::new();
     let mut explicit_error = None;
     let explicit_ep = args.endpoint_url();
-    if args.backend == "strata" && explicit_ep.is_none() {
-        return (
-            Vec::new(),
-            Some("--backend strata needs --endpoint or --model http://...".into()),
-        );
-    }
 
     // 1. Explicit endpoint URL (--endpoint, --model http://..., or LLM_ENDPOINT)
     if let Some(ref ep) = explicit_ep {
@@ -144,10 +138,21 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     // 2. Scan processes for running LLM servers
     let mut proc_models = model_detect::detect_models();
 
+    if args.backend == "strata" {
+        proc_models.retain(|m| m.engine == "strata");
+    }
+
     // 3. If no models found by process scan and no explicit endpoint was configured,
     // probe local candidate endpoints (vLLM, llama.cpp, etc.)
     if proc_models.is_empty() && explicit_ep.is_none() {
-        proc_models = model_detect::probe_local_endpoints(auth).await;
+        proc_models = if args.backend == "strata" {
+            model_detect::probe_strata("127.0.0.1", strata::DEFAULT_PORT, auth)
+                .await
+                .into_iter()
+                .collect()
+        } else {
+            model_detect::probe_local_endpoints(auth).await
+        };
     }
 
     // Filter process-detected models by PID if requested (exempt explicitly requested endpoints)
@@ -159,14 +164,13 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     let mut found = explicit_models;
     for m in proc_models {
         let duplicate = found.iter_mut().find(|fm| {
-            (fm.port.is_some() && fm.port == m.port) || (!fm.name.is_empty() && fm.name == m.name)
+            (fm.host == m.host
+                || (model_detect::is_local_host(&fm.host) && model_detect::is_local_host(&m.host)))
+                && ((fm.port.is_some() && fm.port == m.port)
+                    || (fm.port.is_none() && m.port.is_none() && !fm.name.is_empty() && fm.name == m.name))
         });
         if let Some(fm) = duplicate {
-            let is_loopback = matches!(
-                fm.host.as_str(),
-                "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" | "[::1]"
-            );
-            if is_loopback {
+            if model_detect::is_local_host(&fm.host) {
                 if fm.pid == 0 {
                     fm.pid = m.pid;
                 }
@@ -206,8 +210,10 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
                 if let Some(info) =
                     model_detect::probe_strata(&model.host, port, &auth_for(model, auth)).await
                 {
-                    model.name = info.name;
-                    model.ctx_max = info.ctx_max;
+                    if info.name != format!("strata-{port}") {
+                        model.name = info.name;
+                    }
+                    model.ctx_max = info.ctx_max.or(model.ctx_max);
                 }
             }
         }
@@ -321,7 +327,7 @@ async fn poll_server(
             let delay = if misses >= 3 {
                 poll.max(Duration::from_secs(2))
             } else {
-                poll.max(Duration::from_millis(200))
+                poll.max(Duration::from_millis(400))
             };
             tokio::time::sleep(delay).await;
         }
@@ -526,7 +532,7 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
     match slots.len() {
         0 => format!(
-            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang) — press r to rescan"
+            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang / Strata) — press r to rescan"
         ),
         1 => format!("{prefix}attached to {}", slots[0].model),
         n => format!(
@@ -1005,10 +1011,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     slot.ctx_max = s.ctx_max;
                 }
                 if let Some(m) = &s.strata {
-                    if let Some(name) = strata::text(&m.engine, "model") {
+                    if let Some(name) = strata::text(&m.engine, "model").filter(|name| !name.is_empty()) {
                         slot.model.name = name.to_string();
                     }
-                    slot.model.ctx_max = m.context_max();
+                    if let Some(ctx) = m.context_max() {
+                        slot.model.ctx_max = Some(ctx);
+                    }
+                    // /metrics reports image support, not the encoder device.
+                    match m.engine.get("images").and_then(serde_json::Value::as_bool) {
+                        Some(false) => slot.model.vision = None,
+                        Some(true) if slot.model.vision.is_none() => {
+                            slot.model.vision = Some(vision::Vision {
+                                loaded: None,
+                                place: vision::Place::Unknown,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 slot.perf.observe(&s, now);
                 slot.live = s;
@@ -1426,9 +1445,6 @@ mod tests {
             assert_eq!(m.name, "Qwen3.8-Flash-Next-IQ3_S");
             assert_eq!(m.ctx_max, Some(262144));
         }
-        let args = Args::try_parse_from(["llm-visuals", "--backend", "strata"]).unwrap();
-        let (_, err) = discover(&args, &HttpAuth::default()).await;
-        assert!(err.unwrap().contains("needs --endpoint"));
     }
 
     #[tokio::test]

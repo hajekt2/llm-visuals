@@ -117,9 +117,20 @@ Monitor: live prompt + generated tokens, else the last request when idle.
 Server-lifetime totals are taken from `totals`; request rows are rendered from
 `requests`, not fabricated from polling boundaries or imported into SQLite.
 Missing metrics clear the snapshot, and the same poller retries with backoff.
-The focused Strata layout renders hardware from the remote snapshot instead of
-local driver telemetry. Unsupported TTFT, speculative acceptance and parked
-occupancy are labelled unavailable. See the README's Strata field table.
+Strata polls at least 400 ms apart. Process detection reads its config in the
+server's mount namespace, loads the first native GGUF header and folds the native
+engine child's GPU allocations onto the HTTP PID. Local detected servers share
+the per-card GPU/system-RAM rendering; URL-only servers use remote hardware and
+histories exclusively. Both share context/speculative panels. Layer/expert zooms
+show metadata/cache facts, not guessed placement or synthetic routing.
+
+Since Strata 0.1.35, optional offered/accepted totals feed `SpecStats`' existing
+1.5-second delta windows directly from the live snapshot. A changed `totals.since`
+or decreased counters resets the baseline. Finished-request percentages are
+rendered from nullable request counters. Strata supplies no verification-step
+counter, so tokens/step and steps/s are deliberately omitted. Older servers keep
+"Strata does not report draft acceptance". TTFT and parked occupancy remain
+unavailable. See the README's Strata field table.
 
 **HuggingFace `config.json`** (safetensors dirs, including nested
 `text_config`) fills the same architecture fields as a GGUF header, so the

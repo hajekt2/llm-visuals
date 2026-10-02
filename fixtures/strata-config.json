@@ -1,0 +1,4 @@
+{
+  "model_name": "synthetic-config-model",
+  "args": ["--native", "fixtures/synthetic.gguf", "--max-context", "32768"]
+}

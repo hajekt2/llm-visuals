@@ -257,6 +257,16 @@ impl SpecStats {
     }
 
     fn observe(&mut self, m: &SpecMetrics, now: Instant) {
+        // A reset starts a new baseline; never mix pre-restart deltas into
+        // the new server's window (saturating subtraction alone is not enough).
+        if self.last.as_ref().is_some_and(|prev| {
+            m.draft_tokens < prev.draft_tokens
+                || m.accepted < prev.accepted
+                || m.verify_steps < prev.verify_steps
+                || m.tokens_predicted < prev.tokens_predicted
+        }) {
+            *self = Self::new();
+        }
         self.available = true;
         if let (Some(prev), Some(t0)) = (&self.last, self.last_time) {
             let d = |a: u64, b: u64| a.saturating_sub(b) as usize;
@@ -611,6 +621,34 @@ impl PerfTracker {
     /// Its recent requests are rendered from /metrics, not reconstructed from
     /// polling edges (which cannot measure TTFT or recover live prefix reuse).
     fn observe_strata(&mut self, m: &crate::strata::StrataMetrics, now: Instant) {
+        let restarted = self
+            .last_sample
+            .as_ref()
+            .and_then(|(_, s)| s.strata.as_ref())
+            .is_some_and(|prev| {
+                prev.totals.get("since") != m.totals.get("since")
+                    || prev.engine.get("model") != m.engine.get("model")
+                    || crate::strata::number(&m.totals, "requests")
+                        .zip(crate::strata::number(&prev.totals, "requests"))
+                        .is_some_and(|(a, b)| a < b)
+            });
+        if restarted {
+            self.spec = SpecStats::new();
+        }
+        if let Some((draft_tokens, accepted)) = crate::strata::draft_counts(&m.totals) {
+            self.observe_spec(
+                &SpecMetrics {
+                    draft_tokens,
+                    accepted,
+                    // Strata has no verification-step counter. The renderer must
+                    // not invent a tokens/step number from mtp_max or output count.
+                    ..Default::default()
+                },
+                now,
+            );
+        } else {
+            self.spec = SpecStats::new();
+        }
         self.phase = match m.state() {
             "reading" => Phase::Prefill,
             "generating" => Phase::Decode,
@@ -653,6 +691,13 @@ impl PerfTracker {
             return;
         }
         self.poll_ok = true;
+        if self
+            .last_sample
+            .as_ref()
+            .is_some_and(|(_, prev)| prev.strata.is_some())
+        {
+            self.spec = SpecStats::new();
+        }
         let Some((t0, prev)) = self.last_sample.clone() else {
             self.last_sample = Some((now, s.clone()));
             if s.processing {

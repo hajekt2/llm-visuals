@@ -48,7 +48,7 @@ pub struct Args {
     #[arg(long)]
     pub endpoint: Option<String>,
 
-    /// Explicit endpoint backend (auto-detected by default)
+    /// Backend selection and local discovery filter (auto-detected by default)
     #[arg(long, value_parser = ["auto", "strata"], default_value = "auto")]
     pub backend: String,
 

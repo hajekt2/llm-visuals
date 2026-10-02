@@ -527,35 +527,61 @@ file is required. For a server on another machine:
 
 ```sh
 cargo install --path . --locked
-llm-visuals --endpoint http://inference-host:8080 --backend strata
+llm-visuals --backend strata --endpoint http://inference-host:8095 --log-db off
 ```
 
 `--endpoint` alone also auto-detects Strata from the JSON metrics shape.
-`--model http://inference-host:8080/v1` works too. Local
-`python serve/server.py --engine strata` launchers are detected by process
-scan, including their `--host` and `--port`. A remote server must be selected
-by URL; the dashboard does not scan your network.
+`--model http://inference-host:8095/v1` works too. Local
+`python serve/server.py --engine strata` (or `python -m serve.server`) launchers
+are detected by process scan, including their `--host` and `--port` (default
+8095). `--backend strata` without a URL restricts discovery to Strata;
+the default `auto` backend also lists other engines alongside it.
+A remote server must be selected by URL; the dashboard does not scan your network.
+
+Locally, the `--config` JSON provides `model_name`, the first `--native` GGUF
+shard and `--max-context`. Reading that GGUF supplies header facts such as
+layers, attention/KV heads, MoE expert counts and engram shape. The native
+`strata --serve` child's GPU memory is folded onto its HTTP parent's PID,
+including allocations on multiple cards. Container config and GGUF paths
+are read through `/proc/<pid>/root` or `/proc/<pid>/cwd`, not the dashboard's
+working directory. Published Docker ports are resolved through docker-proxy
+when namespace tables are readable. For rootless Docker, inaccessible `/proc`
+or NAT without docker-proxy, use the explicit published `--endpoint` URL.
 
 The Strata view shows server-windowed decode and engine-measured mean prefill
 rates (with local display smoothing and history), model/context fill, prompt
-progress, state/phase and queued requests. Its hardware panel uses the
-**server's** GPU, PCIe, CPU, RAM and disk readings, never the monitoring
-machine's telemetry. It also shows KV mode/residency, expert-cache capacity
+progress, state/phase and queued requests, plus the CONTEXT bar and SPECULATIVE
+panel. For a process detected locally, the GPU panel uses local driver telemetry
+with separate cards, histories and the system RAM graph. For a remote/URL-only
+server, the hardware panel uses the **server's** GPU, PCIe, CPU, RAM and disk
+readings and GPU/RAM histories, never the monitoring machine's telemetry. It also shows KV mode/residency, expert-cache capacity
 and slots, free VRAM, speculative/MTP/lookup settings, conversation-cache
 capacity, prefix reuse and expert-cache hits from recent requests. Wider
 terminals include engine allocation settings and request RAM/file blob counts.
 Recent requests come directly from Strata, newest first, with measured prompt
 and decode rates/times and finish reasons.
 
-**Unavailable is not zero.** The verified `/metrics` contract does not expose
-TTFT, draft offered/accepted counters, current prefix reuse, or the number of
-parked conversations. These are explicitly marked unavailable; `prompt_ms`
-is shown as **prompt time**, not TTFT, and configured conversation-cache slots
-are **capacity**, not occupancy. Expert `hit_rate` is not speculative
-acceptance or prompt-cache hit rate. No layer placement, expert identities,
-weight/KV memory split or bandwidth bottleneck is invented. While Strata has
-focus, the zoom/view keys retain these Strata panels rather than showing
-unsupported layer/expert simulations.
+**Acceptance requires Strata 0.1.35 or newer.** Finished requests report
+`drafts_offered` and `drafts_accepted` (nullable). Request acceptance is
+accepted / offered; the SPECULATIVE gauge uses deltas of the running `totals`
+counters over the existing 1.5-second rate window. Initial totals are a baseline,
+not a new burst. Counter resets and changes to `totals.since` clear the window.
+The totals label is server-lifetime, not dashboard-session lifetime. No recent
+completions or zero offered means no defined window percentage (`—`); missing
+fields retain **"Strata does not report draft acceptance"**. Counts arrive only
+when requests finish, not while decoding. Neither verification-step frequency
+nor tokens/step can be inferred from these two counters.
+
+**Unavailable is not zero.** Strata 0.1.31 does not expose acceptance, TTFT,
+current prefix reuse or parked-conversation occupancy. `prompt_ms` is shown as
+**prompt time**, not TTFT; conversation-cache slots are **capacity**, not
+occupancy. Expert `hit_rate` is not speculative acceptance or prompt-cache hit
+rate. No layer placement, expert identities, weight/KV memory split or bandwidth
+bottleneck is invented. GPU memory totals alone cannot separate resident
+weights, the expert cache, KV and allocator overhead. Image support is reported,
+but encoder placement is unknown. Press `p` for the graph-focused layout,
+`h`/`m` for GGUF architecture and expert-cache facts (not simulated routing),
+and `v` for the multi-model comparison.
 
 | Strata display | JSON fields from `/metrics` |
 |---|---|
@@ -564,8 +590,9 @@ unsupported layer/expert simulations.
 | Phase, queue, progress | `live.state`, `phase`, `queued`, `elapsed_s`, `prompt_read`, `prompt_total`, `max_tokens` |
 | KV, experts, VRAM | `engine.kv`, `kv_resident`, `expert_cache_mib`, `expert_slots`, `expert_cache_primary_mib`, `expert_slots_primary`, `vram_free_mib` |
 | Spec/cache settings | `engine.spec`, `mtp_max`, `lookup`, `conversation_cache_mib`, `conversation_cache_slots`, `conversation_cache_min_free_mib`; allocation/settings line uses `arena_mib`, `pool_workers`, `pcie_frac`, `spec_min_p`, `cvec`, `version`, `images` |
-| Hardware | `hardware.gpu_*`, `cpu`, `ram_used`, `ram_total`, `disk_read_mb`, `disk_write_mb`; names/counts from `hardware_static`. Byte sizes are converted to GiB; PCIe/disk rates are MiB/s. Multi-GPU telemetry follows Strata's aggregation |
+| Hardware | Remote: `hardware.gpu_*`, `cpu`, `ram_used`, `ram_total`, `disk_read_mb`, `disk_write_mb`; names/counts from `hardware_static`; graphs from `history.gpu_util`, `history.ram_used`. Byte sizes are GiB; PCIe/disk rates are MiB/s. Remote multi-GPU telemetry follows Strata's aggregation; a local detected process uses per-card driver telemetry |
 | Request history | `requests[].finish`, `prompt_tokens`, `reused`, `output_tokens`, `prompt_ms`, `decode_tok_s`, `duration_s`, `hit_rate`, `file_mb`, `ram_blobs`, `file_blobs`; prefill = `(prompt_tokens − reused) / (prompt_ms / 1000)` |
+| Speculative acceptance (0.1.35+) | `requests[].drafts_accepted / drafts_offered`; gauge from deltas of `totals.drafts_accepted`, `totals.drafts_offered`, reset identity from `totals.since` |
 | Server totals, tok/J | `totals.requests`, `prompt_tokens`, `reused`, `output_tokens`; tok/J = server decode rate / `hardware.gpu_power` |
 
 Missing/null/renamed fields read as `—`. A failed scrape clears the remote
@@ -576,7 +603,8 @@ request table, so polling does not fabricate TTFT or duplicate old requests.
 The SQLite GPU table continues to describe the dashboard host, not the remote
 server. Use `--log-db off` for a console-only session.
 
-Live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
+The [Strata reconciliation report](docs/STRATA-RECONCILIATION.md) compares the
+adapters and the reference video, including limits of remote monitoring.
 Parser fixtures and provenance are described in [fixtures/README.md](fixtures/README.md).
 
 ## Command-line options
@@ -585,7 +613,7 @@ Parser fixtures and provenance are described in [fixtures/README.md](fixtures/RE
 --demo               synthetic servers and GPUs; exercises every panel
 --demo-models N      how many synthetic servers --demo runs (default 2)
 --endpoint <url>     inference server endpoint URL (e.g. http://localhost:7000/v1)
---backend auto|strata explicit endpoint backend (default: auto)
+--backend auto|strata backend selection/discovery filter (default: auto)
 --model <id|url|auto>`auto` (default) observes running servers or local endpoints;
                      an HTTP URL attaches to that inference endpoint;
                      an HF id streams real attention via the Python bridge
@@ -593,7 +621,7 @@ Parser fixtures and provenance are described in [fixtures/README.md](fixtures/RE
 --pid A,B            only watch these PIDs (default: every model found)
 --gpu 0,1            GPU indices to show (default: all)
 --no-nvml            use nvidia-smi subprocesses instead of native NVML telemetry
---poll-ms 200        sampling interval for the server and GPU telemetry
+--poll-ms 200        sampling interval; Strata HTTP polls are at least 400 ms
 --api-key-file PATH  bearer token file for inference-server HTTP requests
 --color auto|truecolor|256
 --theme defrag|neon|fire|ocean|monochrome|braille
