@@ -640,6 +640,9 @@ host-visible device numbers/PIDs. Reading another user's descriptors can need
 additional permissions. Unknown placement is not attributed to every vendor;
 visibility masks alone do not establish use on a mixed host (including Intel
 masks). Pure NVIDIA and Intel hosts retain their affinity-mask fallback.
+Strata servers are recognized from their process and `--ple-gguf` model source;
+only process/GPU telemetry is shown for them. No HTTP counter adapter is
+implemented for Strata, so the dashboard does not send it llama.cpp probes.
 
 **MTP panel says "start llama-server with --metrics".** Exactly that; see
 above.

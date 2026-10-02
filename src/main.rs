@@ -262,6 +262,9 @@ fn spawn_pollers(
         .collect();
     models
         .iter()
+        // Strata is process/GPU telemetry only until its counter API has an
+        // adapter. Never send llama.cpp probes to an unrelated engine.
+        .filter(|m| m.engine != "strata")
         .filter_map(|m| m.port.map(|port| (m.clone(), port)))
         .map(|(m, port)| {
             let live_tx = live_tx.clone();
@@ -1274,6 +1277,25 @@ mod tests {
 
     async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
         super::discover(args, auth, &[]).await
+    }
+
+    #[tokio::test]
+    async fn strata_telemetry_does_not_start_http_pollers() {
+        let mut model = demo::demo_models(8192, 1).remove(0);
+        model.engine = "strata".into();
+        model.port = Some(8098);
+        let (live, _) = mpsc::channel(1);
+        let (spec, _) = mpsc::channel(1);
+        let (experts, _) = mpsc::channel(1);
+        assert!(spawn_pollers(
+            &[model],
+            &live,
+            &spec,
+            &experts,
+            Duration::from_millis(200),
+            &HttpAuth::default()
+        )
+        .is_empty());
     }
 
     #[test]

@@ -787,6 +787,7 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
         "ollama",
         "vllm",
         "sglang",
+        "strata",
         "exllama",
         "text-generation",
         "aphrodite",
@@ -900,6 +901,8 @@ fn engine_from(process_name: &str, cmdline: &str) -> String {
         "vllm".into()
     } else if blob.contains("sglang") {
         "sglang".into()
+    } else if blob.contains("strata") {
+        "strata".into()
     } else if blob.contains("exllama") {
         "exllamav2".into()
     } else {
@@ -933,7 +936,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
         };
 
         match key {
-            "--model" | "-m" | "--model-path" => {
+            // Strata's packed weights have no GGUF header; the PLE source
+            // does, and identifies the model without guessing a pack name.
+            "--model" | "-m" | "--model-path" | "--ple-gguf" => {
                 if let Some(v) = next() {
                     let p = PathBuf::from(&v);
                     parsed.name = p
@@ -2229,6 +2234,20 @@ mod tests {
         let apps =
             amd_compute_apps_at(&[amd_only], &host.root.join("proc"), &host.root.join("sys"));
         assert!(apps.iter().all(|a| a.gpu_index == 0));
+    }
+
+    #[test]
+    fn strata_gpu_process_is_a_server_not_an_unidentified_worker() {
+        let cmd = "/opt/strata/build/strata --serve --pack /pack --native --ple-gguf /models/Qwen-Flash-Next.gguf";
+        assert!(looks_like_llm("strata", cmd));
+        let parsed = parse_cmdline("strata", cmd);
+        assert_eq!(parsed.engine, "strata");
+        assert_eq!(parsed.name, "Qwen-Flash-Next");
+        assert_eq!(
+            parsed.path,
+            Some(PathBuf::from("/models/Qwen-Flash-Next.gguf"))
+        );
+        assert_eq!(parsed.port, None); // not a guessed llama.cpp API
     }
 
     #[test]
