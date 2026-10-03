@@ -1,0 +1,6 @@
+{
+  "model_name": "synthetic-config-model",
+  "host": "172.16.0.73",
+  "port": 8098,
+  "args": ["--native", "fixtures/synthetic.gguf", "--max-context", "32768"]
+}

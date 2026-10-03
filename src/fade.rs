@@ -205,7 +205,7 @@ impl FadeState {
 
         let head = self.kv_frac.clamp(0.0, 1.0);
         self.kv_head = smooth(self.kv_head, head, dt, 0.25, 0.9);
-        let n_kv = sample.kv_filled.len().max(1).min(KV_BUCKETS);
+        let n_kv = sample.kv_filled.len().clamp(1, KV_BUCKETS);
         if self.kv.len() != n_kv {
             self.kv.resize(n_kv, 0.0);
         }

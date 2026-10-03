@@ -66,7 +66,7 @@ pub struct Dashboard<'a> {
     pub demo: bool,
     /// Real routing from the patched server, when available.
     pub experts: Option<&'a ExpertStats>,
-    /// GPU telemetry backend: "nvml", "smi", "xpu", "amd", or "demo".
+    /// GPU telemetry backends: "nvml", "smi", "xpu", "amd", combinations, or "demo".
     pub gpu_backend: Option<&'a str>,
     /// The settings screen, drawn over the view while it is open.
     pub settings: Option<&'a SettingsForm>,
@@ -75,6 +75,15 @@ pub struct Dashboard<'a> {
     /// The context-speed screen (`c`): per-model buckets or why not, and
     /// which model is shown.
     pub ctx_speed: Option<(&'a Result<Vec<ContextSpeed>, String>, usize)>,
+}
+
+impl Dashboard<'_> {
+    fn serving_gpus(&self) -> impl Iterator<Item = &GpuStats> {
+        self.gpus.iter().filter(|g| {
+            self.detected
+                .is_some_and(|m| m.uses_gpu(g.index, self.gpus))
+        })
+    }
 }
 
 pub struct Renderer {
@@ -162,12 +171,411 @@ impl Renderer {
         if bar_h > 0 {
             self.render_models_bar(frame, rows[1], d);
         }
-        match d.view {
-            ViewMode::Models => self.render_compare(frame, rows[2], d),
-            ViewMode::Bandwidth => self.render_bandwidth(frame, rows[2], d),
-            _ => self.render_panels(frame, rows[2], d),
+        if d.detected.is_some_and(|m| m.engine == "strata") && d.view != ViewMode::Models {
+            self.render_strata(frame, rows[2], d);
+        } else {
+            match d.view {
+                ViewMode::Models => self.render_compare(frame, rows[2], d),
+                ViewMode::Bandwidth => self.render_bandwidth(frame, rows[2], d),
+                _ => self.render_panels(frame, rows[2], d),
+            }
         }
         self.render_footer(frame, rows[3], d);
+    }
+
+    /// Keep Strata's measured rates and request log, but share context/spec and
+    /// local GPU panels with the other engines. Never use local GPUs remotely.
+    fn render_strata(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let Some(m) = &d.live.strata else {
+            strata_panel(
+                frame,
+                area,
+                " ◆ STRATA ",
+                vec![
+                    "Metrics unavailable - waiting for /metrics (automatic retry)".into(),
+                    "No stale rates or remote hardware readings shown.".into(),
+                ],
+            );
+            return;
+        };
+        if matches!(d.view, ViewMode::Heatmap | ViewMode::MoE) {
+            self.render_strata_architecture(frame, area, d, m);
+            return;
+        }
+        if d.view == ViewMode::Bandwidth {
+            strata_panel(
+                frame,
+                area,
+                " ◆ STRATA · BANDWIDTH ",
+                vec![
+                    "Per-layer weight placement and verification steps are not reported.".into(),
+                    format!(
+                        "Measured PCIe RX {} · TX {} MiB/s",
+                        strata_num(&m.hardware, "gpu_pcie_rx_mb", 1),
+                        strata_num(&m.hardware, "gpu_pcie_tx_mb", 1)
+                    ),
+                ],
+            );
+            return;
+        }
+        let engine_h = if d.view == ViewMode::Perf || area.height < 34 {
+            0
+        } else {
+            10
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(10),
+                Constraint::Length(4),
+                Constraint::Length(engine_h),
+                Constraint::Length(if area.height >= 34 { 9 } else { 6 }),
+            ])
+            .split(area);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(rows[0]);
+        self.render_throughput(frame, top[0], d);
+        if d.detected.is_some_and(|model| model.pid != 0) {
+            self.render_gpus(frame, top[1], d);
+        } else {
+            self.render_strata_hardware(frame, top[1], m);
+        }
+        let context = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[1]);
+        self.render_context(frame, context[0], d);
+        self.render_spec(frame, context[1], d);
+        if engine_h > 0 {
+            self.render_strata_engine(frame, rows[2], d, m);
+        }
+        self.render_strata_requests(frame, rows[3], m);
+    }
+
+    fn render_strata_architecture(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        d: &Dashboard,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let mut lines = vec![];
+        if let Some(g) = d.detected.and_then(|model| model.gguf.as_ref()) {
+            lines.push(format!(
+                "{} · {} layers × {} heads · {} KV heads",
+                g.architecture, g.n_layers, g.n_heads, g.n_kv_heads
+            ));
+            lines.push(format!(
+                "MoE {} of {} experts per token · MTP layers {}",
+                g.n_experts_used, g.n_experts, g.n_mtp
+            ));
+            if let Some(e) = &g.engram {
+                lines.push(format!("engram {}-gram", e.ngram_size));
+            }
+        } else {
+            lines
+                .push("Architecture unavailable: GGUF header is not readable on this host.".into());
+        }
+        lines.push(format!(
+            "Expert cache {} MiB / {} slots · last hit {}%",
+            strata_num(&m.engine, "expert_cache_mib", 0),
+            strata_num(&m.engine, "expert_slots", 0),
+            strata_scaled(
+                m.requests.first().unwrap_or(&serde_json::Value::Null),
+                "hit_rate",
+                100.0,
+                1
+            )
+        ));
+        lines.push("Strata does not report layer placement, attention or expert routing.".into());
+        strata_panel(
+            frame,
+            area,
+            " ◆ STRATA · LAYERS / EXPERTS · metadata only ",
+            lines,
+        );
+    }
+
+    fn render_strata_hardware(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let h = &m.hardware;
+        strata_panel(
+            frame,
+            area,
+            " ◆ SERVER HARDWARE · /metrics ",
+            vec![
+                format!(
+                    "{} · {} GPU(s)",
+                    strata_text(&m.hardware_static, "gpu_name"),
+                    strata_num(&m.hardware_static, "gpu_count", 0)
+                ),
+                format!(
+                    "GPU {}% · {} °C · {} / {} W",
+                    strata_num(h, "gpu_util", 0),
+                    strata_num(h, "gpu_temp", 0),
+                    strata_num(h, "gpu_power", 1),
+                    strata_num(h, "gpu_power_limit", 0)
+                ),
+                format!(
+                    "VRAM {} / {} GiB · engine free {} MiB",
+                    strata_gib(h, "gpu_mem_used"),
+                    strata_gib(h, "gpu_mem_total"),
+                    strata_num(&m.engine, "vram_free_mib", 0)
+                ),
+                format!(
+                    "PCIe RX {} · TX {} MiB/s · gen {} x{}",
+                    strata_num(h, "gpu_pcie_rx_mb", 1),
+                    strata_num(h, "gpu_pcie_tx_mb", 1),
+                    strata_num(h, "gpu_pcie_gen", 0),
+                    strata_num(h, "gpu_pcie_width", 0)
+                ),
+                format!(
+                    "CPU {}% · RAM {} / {} GiB",
+                    strata_num(h, "cpu", 1),
+                    strata_gib(h, "ram_used"),
+                    strata_gib(h, "ram_total")
+                ),
+                format!(
+                    "Disk read {} · write {} MiB/s",
+                    strata_num(h, "disk_read_mb", 1),
+                    strata_num(h, "disk_write_mb", 1)
+                ),
+                format!(
+                    "{} · {} cores / {} threads",
+                    strata_text(&m.hardware_static, "cpu_name"),
+                    strata_num(&m.hardware_static, "cores", 0),
+                    strata_num(&m.hardware_static, "threads", 0)
+                ),
+            ],
+        );
+        // These are server-side histories, not local GPU/RAM samples.
+        if area.height >= 14 && area.width >= 30 {
+            let charts = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(Rect::new(
+                    area.x + 1,
+                    area.y + 9,
+                    area.width.saturating_sub(2),
+                    area.height - 10,
+                ));
+            for (chart, key, label, scale) in [
+                (charts[0], "gpu_util", "GPU utilization", Some(100.0)),
+                (
+                    charts[1],
+                    "ram_used",
+                    "SYSTEM RAM",
+                    crate::strata::number(h, "ram_total"),
+                ),
+            ] {
+                let values: Vec<f32> = m
+                    .history
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_f64())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| v as f32)
+                    .collect();
+                let mut lines = vec![Line::from(Span::styled(
+                    label,
+                    Style::default().fg(pal::c(pal::TEAL)),
+                ))];
+                if let Some(scale) = scale.filter(|n| *n > 0.0) {
+                    if !values.is_empty() {
+                        lines.extend(
+                            sparkline(
+                                &values,
+                                chart.width as usize,
+                                chart.height.saturating_sub(1) as usize,
+                                scale as f32,
+                                pal::FLOW,
+                            )
+                            .into_iter()
+                            .map(Line::from),
+                        );
+                    }
+                }
+                frame.render_widget(Paragraph::new(lines), chart);
+            }
+        }
+    }
+
+    fn render_strata_engine(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        d: &Dashboard,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let e = &m.engine;
+        let l = &m.live;
+        let last = m.requests.first().unwrap_or(&serde_json::Value::Null);
+        let context = m
+            .context_max()
+            .filter(|n| *n > 0)
+            .zip(m.context_used())
+            .map(|(max, used)| {
+                format!(
+                    "{} / {} ({:.1}%)",
+                    fmt_int(used),
+                    fmt_int(max),
+                    (100.0 * used as f64 / max as f64).min(100.0)
+                )
+            })
+            .unwrap_or_else(|| "—".into());
+        let architecture = d
+            .detected
+            .and_then(|model| model.gguf.as_ref())
+            .map(|g| {
+                format!(
+                    "{} layers × {} heads · MoE {}/{} [GGUF metadata]",
+                    g.n_layers, g.n_heads, g.n_experts_used, g.n_experts
+                )
+            })
+            .unwrap_or_else(|| "Layers unknown (GGUF header not readable)".into());
+        let lines = vec![
+            format!("{architecture} · per-layer placement not reported"),
+            format!(
+                "{} · {} · queued {} · elapsed {} s · TTFT unavailable",
+                m.state(),
+                strata_text(l, "phase"),
+                strata_num(l, "queued", 0),
+                strata_num(l, "elapsed_s", 1)
+            ),
+            format!(
+                "Context {} [{}] · prompt progress {} / {}",
+                context,
+                if matches!(m.state(), "idle" | "unloaded") {
+                    "last request"
+                } else {
+                    "live"
+                },
+                strata_num(l, "prompt_read", 0),
+                strata_num(l, "prompt_total", 0)
+            ),
+            format!(
+                "KV {} · resident {} · expert cache {} MiB / {} slots",
+                strata_text(e, "kv"),
+                strata_num(e, "kv_resident", 0),
+                strata_num(e, "expert_cache_mib", 0),
+                strata_num(e, "expert_slots", 0)
+            ),
+            format!(
+                "Spec {} · MTP max {} · lookup {} · acceptance in SPECULATIVE panel",
+                strata_num(e, "spec", 0),
+                strata_num(e, "mtp_max", 0),
+                strata_num(e, "lookup", 0)
+            ),
+            format!(
+                "Conversation cache capacity {} MiB / {} slots · parked count unavailable",
+                strata_num(e, "conversation_cache_mib", 0),
+                strata_num(e, "conversation_cache_slots", 0)
+            ),
+            format!(
+                "Last prompt reuse {} / {} · expert hit {}% · version {}",
+                strata_num(last, "reused", 0),
+                strata_num(last, "prompt_tokens", 0),
+                crate::strata::number(last, "hit_rate")
+                    .map(|n| format!("{:.1}", n * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                strata_text(e, "version")
+            ),
+            format!(
+                "Totals: {} prompt · {} reused · {} gen · {} requests",
+                strata_num(&m.totals, "prompt_tokens", 0),
+                strata_num(&m.totals, "reused", 0),
+                strata_num(&m.totals, "output_tokens", 0),
+                strata_num(&m.totals, "requests", 0)
+            ),
+            format!(
+                "Arena {} MiB · workers {} · PCIe frac {} · spec min p {} · cvec {}",
+                strata_num(e, "arena_mib", 0),
+                strata_num(e, "pool_workers", 0),
+                strata_text(e, "pcie_frac"),
+                strata_text(e, "spec_min_p"),
+                strata_num(e, "cvec", 0)
+            ),
+            format!(
+                "Primary expert cache {} MiB / {} slots · cache RAM floor {} MiB",
+                strata_num(e, "expert_cache_primary_mib", 0),
+                strata_num(e, "expert_slots_primary", 0),
+                strata_num(e, "conversation_cache_min_free_mib", 0)
+            ),
+            format!(
+                "Decode mean {} tok/s · max output {} · images {}",
+                strata_num(l, "tok_s_mean", 1),
+                strata_num(l, "max_tokens", 0),
+                e.get("images")
+                    .and_then(|v| v.as_bool())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into())
+            ),
+        ];
+        strata_panel(frame, area, " ◆ STRATA · CONTEXT / CACHES / ENGINE ", lines);
+    }
+
+    fn render_strata_requests(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        m: &crate::strata::StrataMetrics,
+    ) {
+        let wide = area.width >= 120;
+        let mut heading =
+            "finish     prompt   reused   output   pre t/s   dec t/s  prompt s  accept%"
+                .to_string();
+        if wide {
+            heading.push_str("  total s   hit%   file MB   RAM/file blobs");
+        }
+        let mut lines = vec![heading];
+        for r in &m.requests {
+            let pre = crate::strata::number(r, "prompt_tokens")
+                .zip(crate::strata::number(r, "reused"))
+                .zip(crate::strata::number(r, "prompt_ms").filter(|n| *n > 0.0))
+                .map(|((p, reused), ms)| format!("{:.1}", (p - reused).max(0.0) * 1000.0 / ms))
+                .unwrap_or_else(|| "—".into());
+            let mut row = format!(
+                "{:<8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>8}",
+                strata_text(r, "finish"),
+                strata_num(r, "prompt_tokens", 0),
+                strata_num(r, "reused", 0),
+                strata_num(r, "output_tokens", 0),
+                pre,
+                strata_num(r, "decode_tok_s", 1),
+                strata_scaled(r, "prompt_ms", 0.001, 2),
+                crate::strata::draft_acceptance(r)
+                    .map(|n| format!("{:.1}", n * 100.0))
+                    .unwrap_or_else(|| "—".into())
+            );
+            if wide {
+                row.push_str(&format!(
+                    "  {:>7} {:>6} {:>9}   {}/{}",
+                    strata_num(r, "duration_s", 1),
+                    strata_scaled(r, "hit_rate", 100.0, 1),
+                    strata_num(r, "file_mb", 1),
+                    strata_num(r, "ram_blobs", 0),
+                    strata_num(r, "file_blobs", 0)
+                ));
+            }
+            lines.push(row);
+        }
+        if m.requests.is_empty() {
+            lines.push("No completed requests reported.".into());
+        }
+        strata_panel(
+            frame,
+            area,
+            " ◆ STRATA · RECENT REQUESTS · newest first ",
+            lines,
+        );
     }
 
     fn render_bandwidth(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
@@ -274,10 +682,15 @@ impl Renderer {
 
     fn render_header(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let phase = d.perf.phase;
-        let (badge_rgb, badge_txt) = match phase {
-            Phase::Idle => (pal::TEXT_MUTED, "IDLE"),
-            Phase::Prefill => (pal::MAGENTA, "PREFILL"),
-            Phase::Decode => (pal::CYAN, "DECODE"),
+        let stale = d.live.strata.as_ref().and_then(|m| m.stale_for);
+        let (badge_rgb, badge_txt) = if stale.is_some() {
+            (pal::AMBER, "STALE")
+        } else {
+            match phase {
+                Phase::Idle => (pal::TEXT_MUTED, "IDLE"),
+                Phase::Prefill => (pal::MAGENTA, "PREFILL"),
+                Phase::Decode => (pal::CYAN, "DECODE"),
+            }
         };
         let glow = if phase == Phase::Idle {
             0.55
@@ -296,6 +709,12 @@ impl Renderer {
             self.spinner()
         };
         let mut right_spans: Vec<Span> = Vec::new();
+        if let Some(age) = stale {
+            right_spans.push(Span::styled(
+                format!(" /metrics stale {}s · last values ", age.as_secs()),
+                Style::default().fg(pal::c(pal::AMBER)),
+            ));
+        }
         if d.models.len() > 1 {
             right_spans.push(Span::styled(
                 format!(" model {}/{} ", d.focus + 1, d.models.len()),
@@ -356,9 +775,36 @@ impl Renderer {
                     8,
                     vec![
                         Span::styled(m.engine.clone(), st(pal::TEXT)),
-                        Span::styled(format!(" pid {}", m.pid), st(pal::TEXT_DIM)),
+                        Span::styled(
+                            if m.engine == "strata" && m.pid == 0 {
+                                " endpoint".into()
+                            } else {
+                                format!(" pid {}", m.pid)
+                            },
+                            st(pal::TEXT_DIM),
+                        ),
                     ],
                 ));
+                if let Some(reason) = m.placement.reason() {
+                    let gpus = m
+                        .gpu_indices
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let gpu = if gpus.is_empty() { "?" } else { &gpus };
+                    segs.push((
+                        10,
+                        vec![Span::styled(
+                            format!(
+                                "GPU {gpu} {}: {}",
+                                m.placement.label(),
+                                reason.split(';').next().unwrap_or(reason)
+                            ),
+                            st(pal::AMBER),
+                        )],
+                    ));
+                }
                 if let Some(g) = &m.gguf {
                     segs.push((4, vec![Span::styled(g.architecture.clone(), st(pal::TEXT))]));
                     segs.push((
@@ -407,6 +853,22 @@ impl Renderer {
                         seg.push(Span::styled(format!(" ({dev})"), st(pal::TEXT_DIM)));
                     }
                     segs.push((9, seg));
+                } else if m.engine == "strata"
+                    && d.live.strata.as_ref().is_some_and(|metrics| {
+                        metrics
+                            .engine
+                            .get("images")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+                {
+                    segs.push((
+                        9,
+                        vec![Span::styled(
+                            "vision support (placement unknown)",
+                            st(pal::MAGENTA),
+                        )],
+                    ));
                 }
                 if let Some(q) = quant_from_path(m) {
                     segs.push((2, vec![Span::styled(q, st(pal::TEAL))]));
@@ -493,19 +955,49 @@ impl Renderer {
 
         // Big numerals for the decode rate.
         let live = p.phase == Phase::Decode;
-        let digits = big_digits(fmt_rate_short(p.decode_tps_smooth));
+        let digits = big_digits(
+            if d.live
+                .strata
+                .as_ref()
+                .is_some_and(|m| m.decode_rate().is_none())
+            {
+                "-".into()
+            } else {
+                fmt_rate_short(p.decode_tps_smooth)
+            },
+        );
         let digit_w = digits[0].chars().count();
         let unit_col = digit_w + 2;
         let stat_col = unit_col + 14;
-        let ttft = p
-            .current
-            .as_ref()
-            .and_then(|r| r.ttft())
-            .or_else(|| p.history.back().and_then(|r| r.ttft()));
+        let strata = d.live.strata.as_ref();
+        let ttft = if strata.is_some() {
+            None
+        } else {
+            p.current
+                .as_ref()
+                .and_then(|r| r.ttft())
+                .or_else(|| p.history.back().and_then(|r| r.ttft()))
+        };
+        let tok_j = if let Some(m) = strata {
+            crate::strata::number(&m.hardware, "gpu_power")
+                .filter(|w| *w > 0.0)
+                .zip(m.decode_rate())
+                .map(|(w, rate)| format!("{:.2}", rate as f64 / w))
+                .unwrap_or_else(|| "—".into())
+        } else {
+            format!("{:.2}", p.tokens_per_joule())
+        };
         let right_stats = [
             (
                 "prefill",
-                format!("{} tok/s", fmt_rate(p.prefill_tps_smooth)),
+                format!(
+                    "{} tok/s",
+                    if strata.is_some_and(|m| m.prefill_rate().is_none()) {
+                        "—".into()
+                    } else {
+                        fmt_rate(p.prefill_tps_smooth)
+                    }
+                ),
                 pal::MAGENTA,
             ),
             (
@@ -513,7 +1005,7 @@ impl Renderer {
                 ttft.map(fmt_dur).unwrap_or_else(|| "—".into()),
                 pal::AMBER,
             ),
-            ("tok/J", format!("{:.2}", p.tokens_per_joule()), pal::GREEN),
+            ("tok/J", tok_j, pal::GREEN),
         ];
         let unit_texts = [
             ("tok/s", pal::TEXT),
@@ -563,29 +1055,41 @@ impl Renderer {
         }
 
         // Session line.
-        lines.push(Line::from(vec![
-            Span::styled("session ", Style::default().fg(pal::c(pal::TEXT_DIM))),
-            Span::styled(
-                format!("{} req", p.session_requests),
-                Style::default().fg(pal::c(pal::TEXT)),
-            ),
-            Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
-            Span::styled(
-                format!("{} gen", fmt_int(p.session_decoded as usize)),
-                Style::default().fg(pal::c(pal::CYAN)),
-            ),
-            Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
-            Span::styled(
-                format!("{} prefill", fmt_int(p.session_prefilled as usize)),
-                Style::default().fg(pal::c(pal::MAGENTA)),
-            ),
-            Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
-            Span::styled(
-                format!("{:.0} W", p.total_power_w),
-                Style::default().fg(pal::c(pal::AMBER)),
-            ),
-        ]));
-
+        if let Some(m) = strata {
+            lines.push(Line::from(format!(
+                "server totals: {} req · {} gen",
+                strata_num(&m.totals, "requests", 0),
+                strata_num(&m.totals, "output_tokens", 0)
+            )));
+            lines.push(Line::from(format!(
+                "decode {} · prefill {} tok/s (server)",
+                m.decode_rate().map(fmt_rate).unwrap_or_else(|| "—".into()),
+                m.prefill_rate().map(fmt_rate).unwrap_or_else(|| "—".into())
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("session ", Style::default().fg(pal::c(pal::TEXT_DIM))),
+                Span::styled(
+                    format!("{} req", p.session_requests),
+                    Style::default().fg(pal::c(pal::TEXT)),
+                ),
+                Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+                Span::styled(
+                    format!("{} gen", fmt_int(p.session_decoded as usize)),
+                    Style::default().fg(pal::c(pal::CYAN)),
+                ),
+                Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+                Span::styled(
+                    format!("{} prefill", fmt_int(p.session_prefilled as usize)),
+                    Style::default().fg(pal::c(pal::MAGENTA)),
+                ),
+                Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+                Span::styled(
+                    format!("{:.0} W", p.total_power_w),
+                    Style::default().fg(pal::c(pal::AMBER)),
+                ),
+            ]));
+        }
         // Sparklines fill the rest: decode gets the lion's share.
         let remaining = h.saturating_sub(lines.len());
         if remaining >= 2 {
@@ -708,6 +1212,18 @@ impl Renderer {
     }
 
     fn render_gpu_card(&self, frame: &mut Frame, area: Rect, g: &GpuStats, d: &Dashboard) {
+        if let Some(error) = &g.telemetry_error {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "G{} {} · unavailable: {}",
+                    g.index,
+                    g.short_name(),
+                    error
+                )),
+                area,
+            );
+            return;
+        }
         let w = area.width as usize;
         let gi = g.index as usize;
         let util = d
@@ -788,7 +1304,7 @@ impl Renderer {
         // gpu_indices): white for its cards, grey for everyone else's.
         let affinity = d
             .detected
-            .map(|m| m.gpu_indices.is_empty() || m.gpu_indices.contains(&g.index))
+            .map(|m| m.uses_gpu(g.index, d.gpus))
             .unwrap_or(true);
         let name_style = if affinity {
             Style::default()
@@ -810,8 +1326,19 @@ impl Renderer {
                 .get(gi)
                 .copied()
                 .unwrap_or(g.vram_percent() / 100.0);
-            let weights = d.fade.weight_frac.get(gi).copied().unwrap_or(0.0).min(used);
-            let kv = d.fade.kv_alloc_frac.get(gi).copied().unwrap_or(0.0);
+            let strata = d.detected.is_some_and(|m| m.engine == "strata");
+            // Strata's GGUF file includes offloaded experts, so file size is
+            // not GPU weight residency, nor is the remainder necessarily KV.
+            let weights = if strata {
+                0.0
+            } else {
+                d.fade.weight_frac.get(gi).copied().unwrap_or(0.0).min(used)
+            };
+            let kv = if strata {
+                0.0
+            } else {
+                d.fade.kv_alloc_frac.get(gi).copied().unwrap_or(0.0)
+            };
             let kv_fill = d.fade.kv_frac;
             let label = format!("{:<12}", "   VRAM");
             let txt = format!(" {:>4.1}/{:<4.1}G ", g.vram_gb(), g.vram_total_gb());
@@ -902,7 +1429,12 @@ impl Renderer {
                             )
                         })
                 };
-                if let Some((wt, kt)) = wk {
+                if strata {
+                    spans.push(Span::styled(
+                        " weights/KV unknown",
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    ));
+                } else if let Some((wt, kt)) = wk {
                     spans.push(Span::styled("■", Style::default().fg(pal::c(pal::BLUE))));
                     spans.push(Span::styled(
                         format!(" w {:.1}G ", wt * g.vram_total_gb()),
@@ -1054,14 +1586,39 @@ impl Renderer {
     // -----------------------------------------------------------------------
 
     fn render_context(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        if d.live
+            .strata
+            .as_ref()
+            .is_some_and(|m| m.context_used().is_none() || m.context_max().is_none())
+        {
+            strata_panel(
+                frame,
+                area,
+                " ◆ CONTEXT ",
+                vec!["Context not reported by Strata".into()],
+            );
+            return;
+        }
         let f = d.fade;
         let ctx_max = f.ctx_max.max(1);
         let used = f.ctx_used.min(ctx_max);
         let frac = used as f32 / ctx_max as f32;
         let cached = d.live.cache_tokens.min(used);
         let prompt = d.live.prompt_tokens.min(used).saturating_sub(cached);
+        let scope = d
+            .live
+            .strata
+            .as_ref()
+            .map(|m| {
+                if matches!(m.state(), "idle" | "unloaded") {
+                    " [last request]"
+                } else {
+                    " [live request]"
+                }
+            })
+            .unwrap_or("");
         let title = format!(
-            " ◆ CONTEXT  {} / {}  {:.1}% ",
+            " ◆ CONTEXT  {} / {}  {:.1}%{scope} ",
             fmt_int(used),
             fmt_int(ctx_max),
             frac * 100.0
@@ -1270,7 +1827,10 @@ impl Renderer {
             .unwrap_or(0);
         let enabled = !spec_type.is_empty() && spec_type != "none";
         let mtp = spec_type.to_ascii_lowercase().contains("mtp");
-        let title = if !enabled {
+        let is_strata = d.detected.is_some_and(|m| m.engine == "strata");
+        let title = if is_strata {
+            format!(" ◆ SPECULATIVE  {spec_type} · depth {depth} ")
+        } else if !enabled {
             " ◆ MTP  no speculative decoding ".to_string()
         } else if mtp && depth > 0 {
             format!(" ◆ MTP  {spec_type} · depth {depth} ")
@@ -1289,6 +1849,14 @@ impl Renderer {
         let h = inner.height as usize;
         let mut lines: Vec<Line> = Vec::with_capacity(h);
 
+        if is_strata && !sp.available {
+            lines.push(Line::from(Span::styled(
+                truncate("Strata does not report draft acceptance", w),
+                Style::default().fg(pal::c(pal::AMBER)),
+            )));
+            frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+            return;
+        }
         if !enabled {
             lines.push(Line::from(Span::styled(
                 "the server is not drafting tokens — nothing to accept or reject",
@@ -1329,14 +1897,20 @@ impl Renderer {
 
         // Line 1: windowed acceptance gauge + mean accepted length + step rate.
         let live = sp.drafts_per_sec > 0.0;
-        let rate_txt = format!(" {:>3.0}%", sp.accept_rate * 100.0);
+        let rate_txt = if is_strata && sp.drafts_per_sec == 0.0 {
+            "   — ".into()
+        } else {
+            format!(" {:>3.0}%", sp.accept_rate * 100.0)
+        };
         let label = "accept ";
         let long_tail = format!(
             "  {:.2} tok/step  {:.0} steps/s",
             1.0 + sp.mean_accepted,
             sp.steps_per_sec
         );
-        let tail = if label.len() + rate_txt.len() + long_tail.len() + 12 <= w {
+        let tail = if is_strata {
+            "  finished requests".into()
+        } else if label.len() + rate_txt.len() + long_tail.len() + 12 <= w {
             long_tail
         } else {
             format!("  {:.2}/step", 1.0 + sp.mean_accepted)
@@ -1370,13 +1944,26 @@ impl Renderer {
         if rows > 0 {
             let hist: Vec<f32> = sp.accept_hist.iter().copied().collect();
             let label_w = 7;
-            let session = format!(
-                "  session {:.0}% · {}/{} · {:.0}% of output",
-                sp.session_accept_rate() * 100.0,
-                fmt_int(sp.totals.accepted as usize),
-                fmt_int(sp.totals.draft_tokens as usize),
-                sp.session_draft_share() * 100.0
-            );
+            let session = if is_strata {
+                format!(
+                    "  total {} · {}/{}",
+                    if sp.totals.draft_tokens > 0 {
+                        format!("{:.0}%", sp.session_accept_rate() * 100.0)
+                    } else {
+                        "—".into()
+                    },
+                    fmt_int(sp.totals.accepted as usize),
+                    fmt_int(sp.totals.draft_tokens as usize)
+                )
+            } else {
+                format!(
+                    "  session {:.0}% · {}/{} · {:.0}% of output",
+                    sp.session_accept_rate() * 100.0,
+                    fmt_int(sp.totals.accepted as usize),
+                    fmt_int(sp.totals.draft_tokens as usize),
+                    sp.session_draft_share() * 100.0
+                )
+            };
             let beside = w >= label_w + 24 + session.len();
             let own_line = !beside && rows >= 3;
             let session_w = if beside { session.len() } else { 0 };
@@ -1438,18 +2025,34 @@ impl Renderer {
         let model_gpu_count = d
             .detected
             .map(|m| {
-                if m.gpu_indices.is_empty() {
-                    d.gpus.len().max(1)
+                if m.n_gpu_layers == Some(0) {
+                    0
+                } else if m.gpu_indices.is_empty() {
+                    if crate::gpu::is_mixed(d.gpus) {
+                        0
+                    } else {
+                        d.gpus.len().max(1)
+                    }
                 } else {
                     m.gpu_indices.len()
                 }
             })
             .unwrap_or_else(|| d.gpus.len().max(1));
         let n_gpus = model_gpu_count;
-        let title = format!(
-            " ◆ LAYERS  {n} across {n_gpus} GPU{} ",
-            if n_gpus > 1 { "s" } else { "" }
-        );
+        let title = if d.detected.is_some_and(|m| m.gpu_indices.is_empty())
+            && crate::gpu::is_mixed(d.gpus)
+        {
+            format!(" ◆ LAYERS  {n} · GPU placement unknown ")
+        } else {
+            format!(
+                " ◆ LAYERS  {n} across {n_gpus} GPU{}{} ",
+                if n_gpus > 1 { "s" } else { "" },
+                d.detected
+                    .filter(|m| !matches!(m.placement, crate::placement::Placement::Direct))
+                    .map(|m| format!(" · {}", m.placement.label()))
+                    .unwrap_or_default()
+            )
+        };
         let right = Line::from(Span::styled(
             format!(" theme {} ", self.theme.name),
             Style::default().fg(pal::c(pal::TEXT_MUTED)),
@@ -1489,7 +2092,11 @@ impl Renderer {
             } else {
                 pal::c(pal::TEXT)
             };
-            let tag_col = pal::c(gpu_tags[gpu % gpu_tags.len()]);
+            let tag_col = pal::c(if gpu == crate::gpu::UNKNOWN_GPU {
+                pal::TEXT_DIM
+            } else {
+                gpu_tags[gpu % gpu_tags.len()]
+            });
             let inner_w = tw.saturating_sub(1); // 1-col gutter between tiles
             for dy in 0..th {
                 let y = y0 + dy;
@@ -1521,7 +2128,12 @@ impl Renderer {
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else if dy == 0 && dx == inner_w - 1 && inner_w >= 5 {
-                        Span::styled(format!("{gpu}"), Style::default().fg(tag_col).bg(bg))
+                        let tag = if gpu == crate::gpu::UNKNOWN_GPU {
+                            "?".into()
+                        } else {
+                            format!("{gpu}")
+                        };
+                        Span::styled(tag, Style::default().fg(tag_col).bg(bg))
                     } else if bottom && !hist.is_empty() {
                         let n_h = hist.len();
                         let start = n_h.saturating_sub(inner_w);
@@ -1541,6 +2153,9 @@ impl Renderer {
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 
+    // This grid is reduced along different axes; explicit coordinates keep
+    // the layer/head/token projections readable.
+    #[allow(clippy::needless_range_loop)]
     fn render_attention_heatmap(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let block = panel(" ◆ ATTENTION  layer × token ", pal::BLUE);
         let inner = block.inner(area);
@@ -1586,8 +2201,8 @@ impl Renderer {
             }
         } else {
             let rows = max_rows.max(1);
-            let per_row = (layers + rows - 1) / rows;
-            let vis_rows = (layers + per_row - 1) / per_row;
+            let per_row = layers.div_ceil(rows);
+            let vis_rows = layers.div_ceil(per_row);
             for vis in 0..vis_rows {
                 let l0 = vis * per_row;
                 let l1 = (l0 + per_row).min(layers);
@@ -1645,7 +2260,7 @@ impl Renderer {
             let txt = if d.generated.is_empty() {
                 "generated text will stream here".to_string()
             } else {
-                d.generated.to_string()
+                d.generated.text()
             };
             frame.render_widget(
                 Paragraph::new(txt)
@@ -1664,17 +2279,17 @@ impl Renderer {
         let label_w = 4usize;
         let cols = w.saturating_sub(label_w).max(1);
         // Horizontal: one block per expert when it fits, else `per_block` experts share a block.
-        let per_block = (n_e + cols - 1) / cols;
-        let n_blocks = (n_e + per_block - 1) / per_block;
+        let per_block = n_e.div_ceil(cols);
+        let n_blocks = n_e.div_ceil(per_block);
         let bw = (cols / n_blocks.max(1)).clamp(1, 4);
         let gap = usize::from(bw >= 2 && (bw + 1) * n_blocks <= cols);
         // Vertical: one layer per row, or two per row with half blocks, or grouped.
         let (layers_per_slot, half) = if n_l <= h {
             (1, false)
         } else {
-            (((n_l + 2 * h - 1) / (2 * h)).max(1), true)
+            (n_l.div_ceil(2 * h).max(1), true)
         };
-        let n_slots = (n_l + layers_per_slot - 1) / layers_per_slot;
+        let n_slots = n_l.div_ceil(layers_per_slot);
         let title = if !is_moe {
             " ◆ EXPERTS  dense model ".to_string()
         } else {
@@ -1758,7 +2373,7 @@ impl Renderer {
         };
         let gap_style = Style::default().bg(pal::c(pal::chrome().bg));
         let mut lines: Vec<Line> = Vec::with_capacity(h);
-        let text_rows = if half { (n_slots + 1) / 2 } else { n_slots };
+        let text_rows = if half { n_slots.div_ceil(2) } else { n_slots };
         for r in 0..text_rows.min(h) {
             let top = if half { r * 2 } else { r };
             let bot = top + 1;
@@ -1893,11 +2508,7 @@ impl Renderer {
         } else {
             Span::styled(" ○ ", Style::default().fg(pal::c(pal::TEXT_MUTED)))
         };
-        let dec = if live {
-            r.avg_decode_tps()
-        } else {
-            r.avg_decode_tps()
-        };
+        let dec = r.avg_decode_tps();
         let dec_col = if dec <= 0.0 {
             pal::c(pal::TEXT_MUTED)
         } else {
@@ -2553,7 +3164,16 @@ impl Renderer {
     fn model_row(&self, i: usize, m: &ModelView, d: &Dashboard, w: usize) -> Line<'static> {
         let focused = i == d.focus;
         let p = m.perf;
-        let (badge_rgb, badge) = phase_badge(p.phase);
+        let (badge_rgb, badge) = if m
+            .live
+            .strata
+            .as_ref()
+            .is_some_and(|s| s.stale_for.is_some())
+        {
+            (pal::AMBER, "STALE")
+        } else {
+            phase_badge(p.phase)
+        };
         let name_style = if focused {
             Style::default()
                 .fg(pal::c(pal::WHITE))
@@ -2618,8 +3238,19 @@ impl Renderer {
         ));
 
         let rate = p.decode_tps_smooth;
+        let rate_text = if m.detected.engine == "strata"
+            && m.live
+                .strata
+                .as_ref()
+                .and_then(|s| s.decode_rate())
+                .is_none()
+        {
+            "—".into()
+        } else {
+            fmt_rate(rate)
+        };
         spans.push(Span::styled(
-            format!("{:>6}", fmt_rate(rate)),
+            format!("{rate_text:>6}"),
             Style::default()
                 .fg(if rate > 0.0 {
                     pal::gradient_color(pal::FLOW, 0.85)
@@ -2640,7 +3271,19 @@ impl Renderer {
             spans.push(Span::raw(" "));
         }
 
-        if show_ctx {
+        if show_ctx
+            && m.detected.engine == "strata"
+            && m.live
+                .strata
+                .as_ref()
+                .and_then(|s| s.context_used().zip(s.context_max()))
+                .is_none()
+        {
+            spans.push(Span::styled(
+                "ctx — ",
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
+        } else if show_ctx {
             let ctx_max = m.live.ctx_max.max(1);
             let used = m.live.ctx_used().min(ctx_max);
             let frac = used as f32 / ctx_max as f32;
@@ -2656,9 +3299,13 @@ impl Renderer {
         }
 
         if show_vram {
-            let gb = m.detected.mem_used_mb as f32 / 1024.0;
+            let vram = if m.detected.engine == "strata" && m.detected.pid == 0 {
+                "—".to_string() // Strata does not report per-process VRAM
+            } else {
+                format!("{:.1}", m.detected.mem_used_mb as f32 / 1024.0)
+            };
             spans.push(Span::styled(
-                format!("{gb:>5.1}G "),
+                format!("{vram:>5}G "),
                 Style::default().fg(pal::c(pal::BLUE)),
             ));
         }
@@ -2704,9 +3351,46 @@ impl Renderer {
 
     fn render_model_card(&self, frame: &mut Frame, area: Rect, i: usize, d: &Dashboard) {
         let m = &d.models[i];
+        if m.detected.engine == "strata" {
+            let lines = if let Some(s) = &m.live.strata {
+                vec![
+                    m.detected.name.clone(),
+                    format!("state {}", s.state()),
+                    format!("decode {} tok/s", strata_num(&s.live, "tok_s", 1)),
+                    format!(
+                        "prefill {} tok/s",
+                        strata_num(&s.live, "prefill_tok_s_mean", 1)
+                    ),
+                    format!(
+                        "context {} / {}",
+                        s.context_used().map(fmt_int).unwrap_or_else(|| "—".into()),
+                        s.context_max().map(fmt_int).unwrap_or_else(|| "—".into())
+                    ),
+                    format!(
+                        "expert cache {} MiB",
+                        strata_num(&s.engine, "expert_cache_mib", 0)
+                    ),
+                    "TTFT / acceptance unavailable".into(),
+                    "Remote hardware: focus this model".into(),
+                ]
+            } else {
+                vec![m.detected.name.clone(), "Metrics unavailable".into()]
+            };
+            strata_panel(frame, area, " ◆ STRATA ", lines);
+            return;
+        }
         let p = m.perf;
         let focused = i == d.focus;
-        let (badge_rgb, badge) = phase_badge(p.phase);
+        let (badge_rgb, badge) = if m
+            .live
+            .strata
+            .as_ref()
+            .is_some_and(|s| s.stale_for.is_some())
+        {
+            (pal::AMBER, "STALE")
+        } else {
+            phase_badge(p.phase)
+        };
         let title = format!(
             " {} {} ",
             i + 1,
@@ -2867,7 +3551,11 @@ impl Renderer {
         }
         lines.push(kv(
             "vram",
-            format!("{:.1} G", m.detected.mem_used_mb as f32 / 1024.0),
+            if m.detected.mem_used_mb == 0 && m.detected.placement.reason().is_some() {
+                "not measured".into()
+            } else {
+                format!("{:.1} G", m.detected.mem_used_mb as f32 / 1024.0)
+            },
             pal::BLUE,
         ));
         if !m.detected.gpu_indices.is_empty() {
@@ -2881,6 +3569,20 @@ impl Renderer {
                     .join(","),
                 pal::AMBER,
             ));
+        }
+        if let Some(reason) = m.detected.placement.reason() {
+            lines.push(kv(
+                "source",
+                m.detected.placement.label().into(),
+                pal::AMBER,
+            ));
+            // Multiple lines preserve the exact access-denial cause in compact cards.
+            for chunk in reason.chars().collect::<Vec<_>>().chunks(w.max(1)) {
+                lines.push(Line::from(Span::styled(
+                    chunk.iter().collect::<String>(),
+                    Style::default().fg(pal::c(pal::TEXT_DIM)),
+                )));
+            }
         }
         lines.push(kv(
             "session",
@@ -3071,7 +3773,7 @@ impl Renderer {
         let mut channels = Vec::new();
         let mut facts = Vec::new();
         let mut total_rx = 0.0f32;
-        for g in d.gpus {
+        for g in d.serving_gpus() {
             let i = g.index as usize;
             if let Some(m) = bw.pcie_rx.get(i) {
                 total_rx += m.value;
@@ -3114,7 +3816,7 @@ impl Renderer {
         // ---- VRAM ---------------------------------------------------------
         let mut channels = Vec::new();
         let mut busiest = 0.0f32;
-        for g in d.gpus {
+        for g in d.serving_gpus() {
             let i = g.index as usize;
             if let Some(m) = bw.vram_busy.get(i) {
                 busiest = busiest.max(m.value);
@@ -3241,7 +3943,8 @@ impl Renderer {
             return;
         }
         let stages = self.pipeline_stages(d);
-        let verdict = bandwidth::assess(d.perf, d.gpus);
+        let serving_gpus: Vec<_> = d.serving_gpus().cloned().collect();
+        let verdict = bandwidth::assess(d.perf, &serving_gpus);
         let n = stages.len();
         let w = inner.width as usize;
         let gutter = if w >= n * 18 + (n - 1) * 3 {
@@ -3352,7 +4055,7 @@ impl Renderer {
             ),
         ];
         let reading_w: usize = spans.iter().map(|x| x.content.chars().count()).sum();
-        if !st.tag.is_empty() && reading_w + st.tag.len() + 1 <= w {
+        if !st.tag.is_empty() && reading_w + st.tag.len() < w {
             spans.push(Span::styled(
                 format!(" {}", st.tag),
                 Style::default()
@@ -3475,7 +4178,8 @@ impl Renderer {
     }
 
     fn render_verdict(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
-        let v = bandwidth::assess(d.perf, d.gpus);
+        let serving_gpus: Vec<_> = d.serving_gpus().cloned().collect();
+        let v = bandwidth::assess(d.perf, &serving_gpus);
         let accent = match v.stage {
             Some(StageId::Disk) => pal::AMBER,
             Some(StageId::Ram) => pal::VIOLET,
@@ -3536,6 +4240,39 @@ fn with_right<'a>(block: Block<'a>, title: &str, right: Line<'a>, area: Rect) ->
     } else {
         (block, false)
     }
+}
+
+fn strata_scaled(v: &serde_json::Value, key: &str, scale: f64, precision: usize) -> String {
+    crate::strata::number(v, key)
+        .map(|n| format!("{:.*}", precision, n * scale))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn strata_num(v: &serde_json::Value, key: &str, precision: usize) -> String {
+    strata_scaled(v, key, 1.0, precision)
+}
+
+fn strata_gib(v: &serde_json::Value, key: &str) -> String {
+    strata_scaled(v, key, 1.0 / 1_073_741_824.0, 1)
+}
+
+fn strata_text(v: &serde_json::Value, key: &str) -> String {
+    crate::strata::text(v, key)
+        .unwrap_or("—")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+fn strata_panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<String>) {
+    let block = panel(title, pal::CYAN);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line> = lines
+        .into_iter()
+        .map(|s| Line::styled(s, Style::default().fg(pal::c(pal::TEXT))))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn panel(title: &str, accent: (u8, u8, u8)) -> Block<'static> {
@@ -3804,15 +4541,15 @@ fn sparkline(
             values[start + x - pad]
         };
         if v.is_nan() {
-            for r in 0..rows {
-                out[r].push(Span::raw(" "));
+            for row in &mut out {
+                row.push(Span::raw(" "));
             }
             continue;
         }
         let level = (v / max).clamp(0.0, 1.0);
         let col = pal::gradient_color(grad, level);
         let total = (level * rows as f32 * 8.0).round() as usize;
-        for r in 0..rows {
+        for (r, row) in out.iter_mut().enumerate() {
             let from_bottom = rows - 1 - r;
             let e = total.saturating_sub(from_bottom * 8).min(8);
             let span = if e == 0 {
@@ -3825,7 +4562,7 @@ fn sparkline(
                 let ch = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"][e];
                 Span::styled(ch, Style::default().fg(col))
             };
-            out[r].push(span);
+            row.push(span);
         }
     }
     out
@@ -3888,6 +4625,7 @@ fn braille_sparkline(
 fn big_digits(s: String) -> [String; 3] {
     let glyph = |c: char| -> [&'static str; 3] {
         match c {
+            '-' => ["   ", "───", "   "],
             '0' => ["▄▀▄", "█ █", "▀▀▀"],
             '1' => ["▄█ ", " █ ", "▀▀▀"],
             '2' => ["▀▀▄", "▄▀ ", "▀▀▀"],
@@ -3962,7 +4700,7 @@ pub fn fmt_int(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -4077,14 +4815,14 @@ fn quant_from_path(m: &DetectedModel) -> Option<String> {
     let is_quant = |t: &str| {
         let u = t.to_uppercase();
         let q = u.strip_prefix('I').unwrap_or(&u);
-        (q.starts_with('Q') && q.chars().nth(1).map_or(false, |c| c.is_ascii_digit()))
+        (q.starts_with('Q') && q.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
             || u == "F16"
             || u == "BF16"
             || u == "F32"
     };
     // Tokens are separated by '-' or '.', so "Q3_K_XL" stays intact.
     let mut pos = 0usize;
-    for tok in stem.split(|c| c == '-' || c == '.') {
+    for tok in stem.split(['-', '.']) {
         if !tok.is_empty() && is_quant(tok.split('_').next().unwrap_or(tok)) {
             let tag: String = stem[pos..pos + tok.len()]
                 .chars()
@@ -4095,6 +4833,22 @@ fn quant_from_path(m: &DetectedModel) -> Option<String> {
         pos += tok.len() + 1;
     }
     None
+}
+
+/// 320_001_536 → "320M", 20_000_003 → "20.0M", 4096 → "4.1K".
+fn fmt_count(n: u64) -> String {
+    let f = n as f64;
+    if f >= 1e9 {
+        format!("{:.1}B", f / 1e9)
+    } else if f >= 100e6 {
+        format!("{:.0}M", f / 1e6)
+    } else if f >= 1e6 {
+        format!("{:.1}M", f / 1e6)
+    } else if f >= 1e3 {
+        format!("{:.1}K", f / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -4202,6 +4956,228 @@ mod tests {
     }
 
     #[test]
+    fn strata_layouts_show_remote_facts_without_simulated_routing() {
+        use ratatui::backend::TestBackend;
+        for (width, height) in [(150, 46), (100, 30), (40, 12)] {
+            for view in [
+                ViewMode::All,
+                ViewMode::Perf,
+                ViewMode::MoE,
+                ViewMode::Heatmap,
+                ViewMode::Bandwidth,
+            ] {
+                let metrics =
+                    crate::strata::parse_metrics(include_str!("../fixtures/strata-busy.json"))
+                        .unwrap();
+                let live = crate::strata::StrataAdapter::default().observe(metrics);
+                let mut perf = PerfTracker::new();
+                perf.observe(&live, Instant::now());
+                let mut model = crate::demo::demo_models(262144, 1).remove(0);
+                model.engine = "strata".into();
+                model.pid = 0;
+                model.gguf = None;
+                let fade = FadeState::new();
+                let attention = TokenBuffer::new(10);
+                let generated = GeneratedText::new();
+                let d = Dashboard {
+                    models: &[],
+                    focus: 0,
+                    detected: Some(&model),
+                    gpus: &[],
+                    gpu_error: None,
+                    fade: &fade,
+                    perf: &perf,
+                    live: &live,
+                    attention: &attention,
+                    generated: &generated,
+                    num_layers: 0,
+                    num_heads: 0,
+                    view,
+                    status: "",
+                    theme_name: "defrag",
+                    demo: false,
+                    experts: None,
+                    gpu_backend: None,
+                    settings: None,
+                    log: None,
+                    ctx_speed: None,
+                };
+                let r = Renderer::new(pal::defrag_theme(), 0, 0, 0);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| r.render_view(f, f.area(), &d)).unwrap();
+                let output: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(!output.contains("simulated"));
+                if width >= 100 {
+                    match view {
+                        ViewMode::All | ViewMode::Perf => {
+                            assert!(output.contains("NVIDIA GeForce RTX 3090"));
+                            assert!(output.contains("CONTEXT"));
+                            assert!(output.contains("SPECULATIVE"));
+                            assert!(output.contains("Strata does not report draft acceptance"));
+                            assert!(output.contains("accept%"));
+                            if width == 150 && view == ViewMode::All {
+                                assert!(output.contains("expert cache 13517 MiB / 6958 slots"));
+                                assert!(output.contains("parked count unavailable"));
+                            }
+                        }
+                        ViewMode::Heatmap | ViewMode::MoE => {
+                            assert!(output.contains("GGUF header is not readable"));
+                            assert!(output.contains("does not report layer placement"));
+                        }
+                        ViewMode::Bandwidth => assert!(output.contains("Measured PCIe RX")),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strata_modern_acceptance_and_local_gpu_panels() {
+        use ratatui::backend::TestBackend;
+        for pid in [0, 42] {
+            let mut metrics = crate::strata::parse_metrics(include_str!(
+                "../fixtures/strata-metrics-0.1.35.json"
+            ))
+            .unwrap();
+            if pid == 0 {
+                metrics.engine["images"] = true.into();
+            }
+            let live = crate::strata::StrataAdapter::default().observe(metrics);
+            let mut perf = PerfTracker::new();
+            perf.observe(&live, Instant::now());
+            let mut model = crate::demo::demo_models(262144, 1).remove(0);
+            model.engine = "strata".into();
+            model.pid = pid;
+            if pid == 0 {
+                model.gguf = None;
+                model.vision = None;
+                model.path = None;
+            }
+            let mut fade = FadeState::new();
+            fade.ctx_max = live.ctx_max;
+            fade.ctx_used = live.ctx_used();
+            let attention = TokenBuffer::new(10);
+            let generated = GeneratedText::new();
+            let gpus = vec![
+                crate::gpu::DemoGpu::new(0).step(0.5),
+                crate::gpu::DemoGpu::new(1).step(0.5),
+            ];
+            let second = crate::demo::demo_models(262144, 2).remove(1);
+            let views = vec![
+                ModelView {
+                    detected: &model,
+                    perf: &perf,
+                    live: &live,
+                    fade: &fade,
+                    experts: None,
+                    num_layers: model.n_layers(),
+                    num_heads: model.n_heads(),
+                },
+                ModelView {
+                    detected: &second,
+                    perf: &perf,
+                    live: &live,
+                    fade: &fade,
+                    experts: None,
+                    num_layers: second.n_layers(),
+                    num_heads: second.n_heads(),
+                },
+            ];
+            let d = Dashboard {
+                models: &views,
+                focus: 0,
+                detected: Some(&model),
+                gpus: &gpus,
+                gpu_error: None,
+                fade: &fade,
+                perf: &perf,
+                live: &live,
+                attention: &attention,
+                generated: &generated,
+                num_layers: model.n_layers(),
+                num_heads: model.n_heads(),
+                view: ViewMode::Perf,
+                status: "",
+                theme_name: "defrag",
+                demo: false,
+                experts: None,
+                gpu_backend: Some("demo"),
+                settings: None,
+                log: None,
+                ctx_speed: None,
+            };
+            let r = Renderer::new(pal::defrag_theme(), 0, 0, 0);
+            let mut terminal = Terminal::new(TestBackend::new(150, 46)).unwrap();
+            terminal.draw(|f| r.render_view(f, f.area(), &d)).unwrap();
+            let output: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(output.contains("MODELS  2"));
+            assert!(output.contains(&second.short_name()));
+            assert!(output.contains("729/828"));
+            assert!(output.contains("88%"));
+            assert!(output.contains("accept%"));
+            assert!(output.contains("88.0"));
+            assert!(!output.contains("tok/step"));
+            assert!(!output.contains("steps/s"));
+            assert!(!output.contains("does not report draft acceptance"));
+            if pid > 0 {
+                assert!(output.contains("strata pid 42"));
+                assert!(output.contains("41L × 16H"));
+                assert!(output.contains("MoE 8/256"));
+                assert!(output.contains("GPUS"));
+                assert!(output.contains("weights/KV unknown"));
+                assert!(!output.contains("SERVER HARDWARE"));
+            } else {
+                assert!(output.contains("SERVER HARDWARE"));
+                assert!(!output.contains("weights/KV unknown"));
+                assert!(!output.contains("41L × 16H"));
+                assert!(!output.contains("vision G0"));
+                assert!(output.contains("vision support (placement unknown)"));
+            }
+            // Inspectable text captures without changing tracked snapshots.
+            if std::env::var_os("STRATA_CAPTURE").is_some() {
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(150)
+                    .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(format!("target/strata-render-{pid}.txt"), text).unwrap();
+            }
+            let mut stale = live.clone();
+            stale.strata.as_mut().unwrap().stale_for = Some(Duration::from_secs(7));
+            let stale_dashboard = Dashboard { live: &stale, ..d };
+            terminal
+                .draw(|f| r.render_view(f, f.area(), &stale_dashboard))
+                .unwrap();
+            let output: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(output.contains("/metrics stale 7s"));
+            assert!(output.contains("STALE"));
+            assert!(output.contains("accept%")); // request history remains available
+        }
+    }
+
+    #[test]
     fn big_digits_are_three_rows() {
         let d = big_digits("42.7".into());
         assert_eq!(d[0].chars().count(), d[2].chars().count());
@@ -4232,25 +5208,202 @@ mod tests {
     }
 
     #[test]
+    fn mixed_gpu_panels_render_in_both_sizes_and_zoom_views() {
+        use ratatui::backend::TestBackend;
+        let mut model = crate::demo::demo_models(4096, 1).remove(0);
+        model.gpu_indices = vec![1];
+        let gpus = vec![
+            GpuStats {
+                index: 0,
+                backend: "nvml",
+                name: "NVIDIA GeForce RTX 3090".into(),
+                mem_total_mb: 24_576,
+                mem_used_mb: 9_000,
+                utilization_gpu: 39.0,
+                ..Default::default()
+            },
+            GpuStats {
+                index: 1,
+                backend: "amd",
+                name: "AMD Radeon RX 7900 XTX".into(),
+                mem_total_mb: 24_576,
+                mem_used_mb: 16_384,
+                utilization_gpu: 72.0,
+                ..Default::default()
+            },
+        ];
+        let fade = FadeState::new();
+        let perf = PerfTracker::new();
+        let live = LiveStats::default();
+        let attention = TokenBuffer::new(80);
+        let generated = GeneratedText::new();
+        let models = [ModelView {
+            detected: &model,
+            perf: &perf,
+            live: &live,
+            fade: &fade,
+            experts: None,
+            num_layers: 41,
+            num_heads: 32,
+        }];
+        let mut d = Dashboard {
+            models: &models,
+            focus: 0,
+            detected: Some(&model),
+            gpus: &gpus,
+            gpu_error: None,
+            fade: &fade,
+            perf: &perf,
+            live: &live,
+            attention: &attention,
+            generated: &generated,
+            num_layers: 41,
+            num_heads: 32,
+            view: ViewMode::All,
+            status: "fixture",
+            theme_name: "defrag",
+            demo: false,
+            experts: None,
+            gpu_backend: Some("nvml+amd"),
+            settings: None,
+            log: None,
+            ctx_speed: None,
+        };
+        let renderer = Renderer::new(pal::get_theme("defrag"), 0, 0, 4);
+        for (width, height) in [(150, 46), (100, 30)] {
+            for view in [
+                ViewMode::All,
+                ViewMode::Perf,
+                ViewMode::Models,
+                ViewMode::MoE,
+            ] {
+                d.view = view;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| renderer.render_view(f, f.area(), &d))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                if matches!(view, ViewMode::All | ViewMode::Perf) {
+                    assert!(text.contains("nvml+amd"), "{width}x{height}: {text}");
+                    assert!(text.contains("G0 RTX 3090"), "{text}");
+                    assert!(text.contains("G1 Radeon"), "{text}");
+                }
+            }
+        }
+        let mut unavailable = gpus.clone();
+        unavailable[1].telemetry_error = Some("amdgpu telemetry unreadable".into());
+        d.gpus = &unavailable;
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|f| renderer.render_gpus(f, f.area(), &d))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("unavailable: amdgpu telemetry unreadable"));
+        assert!(text.contains("G0 RTX 3090"));
+        // Single-vendor rendering does not depend on the new identity metadata.
+        let mut single = gpus[..1].to_vec();
+        single[0].backend = "";
+        d.gpus = &single;
+        d.gpu_backend = Some("nvml");
+        terminal
+            .draw(|f| renderer.render_gpus(f, f.area(), &d))
+            .unwrap();
+        let before = terminal.backend().buffer().clone();
+        let mut decorated = single.clone();
+        decorated[0].backend = "nvml";
+        decorated[0].pci_address = Some("0000:01:00.0".into());
+        d.gpus = &decorated;
+        terminal
+            .draw(|f| renderer.render_gpus(f, f.area(), &d))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer(), &before);
+        let mut unknown_model = model.clone();
+        unknown_model.gpu_indices.clear();
+        let mut unknown_fade = FadeState::new();
+        unknown_fade.n_layers = 41;
+        unknown_fade.layer_gpu = vec![crate::gpu::UNKNOWN_GPU; 41];
+        d.detected = Some(&unknown_model);
+        d.fade = &unknown_fade;
+        d.gpus = &gpus;
+        let mut terminal = Terminal::new(TestBackend::new(150, 46)).unwrap();
+        terminal
+            .draw(|f| renderer.render_layers(f, f.area(), &d))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("GPU placement unknown"));
+        assert!(text.chars().filter(|&c| c == '?').count() >= 41);
+
+        for provenance in [
+            crate::placement::Placement::Inferred(
+                "sole unclaimed GPU with VRAM used; permission denied reading /proc/1721/fd".into(),
+            ),
+            crate::placement::Placement::Configured("8080=amd (owner supplied)".into()),
+            crate::placement::Placement::Unavailable(
+                "permission denied reading /proc/1721/fd; needs server-user/root access".into(),
+            ),
+        ] {
+            let mut annotated = model.clone();
+            annotated.name = "Qwen3.8-27B".into();
+            annotated.placement = provenance;
+            let annotated_models = [ModelView {
+                detected: &annotated,
+                ..models[0]
+            }];
+            let annotated_d = Dashboard {
+                detected: Some(&annotated),
+                models: &annotated_models,
+                ..d
+            };
+            for (width, height) in [(150, 46), (100, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| renderer.render_header(f, Rect::new(0, 0, width, 3), &annotated_d))
+                    .unwrap();
+                let header: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(header.contains(annotated.placement.label()), "{header}");
+                terminal
+                    .draw(|f| renderer.render_model_card(f, f.area(), 0, &annotated_d))
+                    .unwrap();
+                let card: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(card.contains(annotated.placement.label()), "{card}");
+            }
+        }
+    }
+
+    #[test]
     fn tile_size_fits_all_layers() {
         let (tw, th, tpr) = layer_tile_size(60, 10, 41);
         let tpc = 10 / th;
         assert!(tpr * tpc >= 41, "{tw}x{th} tpr {tpr}");
-    }
-}
-
-/// 320_001_536 → "320M", 20_000_003 → "20.0M", 4096 → "4.1K".
-fn fmt_count(n: u64) -> String {
-    let f = n as f64;
-    if f >= 1e9 {
-        format!("{:.1}B", f / 1e9)
-    } else if f >= 100e6 {
-        format!("{:.0}M", f / 1e6)
-    } else if f >= 1e6 {
-        format!("{:.1}M", f / 1e6)
-    } else if f >= 1e3 {
-        format!("{:.1}K", f / 1e3)
-    } else {
-        n.to_string()
     }
 }

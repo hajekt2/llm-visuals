@@ -1,0 +1,8 @@
+[
+  {"pid":1688,"ppid":1,"comm":"llama-server","cmdline":"llama-server --models-preset /config/models.ini --port 8080"},
+  {"pid":1721,"ppid":1688,"comm":"llama-server","cmdline":"llama-server --model /models/qwen.gguf --port 34885","fd":"/dev/dri/renderD129","fdinfo":"drm-driver: amdgpu\ndrm-client-id: 5\ndrm-pdev: 0000:43:00.0\ndrm-memory-vram: 22734296 KiB\n"},
+  {"pid":1800,"ppid":1721,"comm":"gpu-worker","cmdline":"gpu-worker","fd":"/dev/dri/renderD129"},
+  {"pid":2000,"ppid":1,"comm":"llama-server","cmdline":"llama-server --model /models/unrelated.gguf --port 8081"},
+  {"pid":3000,"ppid":1,"comm":"llama-server","cmdline":"llama-server --models-preset /config/models.ini --port 8082"},
+  {"pid":3026,"ppid":3000,"comm":"llama-server","cmdline":"llama-server --model /models/container.gguf --port 34886","fd":"/dev/container-amd","container":true}
+]

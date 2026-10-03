@@ -3,7 +3,7 @@
 **A live terminal dashboard for the LLM running on your machine.**
 
 It finds the inference servers you already have up (llama.cpp `llama-server`,
-ollama, vLLM, SGLang, …), reads their counters and NVIDIA, AMD or Intel
+ollama, vLLM, SGLang, Strata, …), reads their counters and NVIDIA, AMD or Intel
 GPU telemetry, and turns them into a truecolor picture of what the model is doing
 right now: tokens per second, time to first token, GPU load and memory, context fill, speculative-decoding
 acceptance, which layers are busy on which GPU, and, with a small server patch,
@@ -42,8 +42,7 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 
 Requirements: a Rust toolchain (1.75+), `nvidia-smi` for NVIDIA GPU panels,
 `xpu-smi` for Intel GPU panels or the Linux amdgpu driver for AMD GPU panels,
-and a locally listening
-`llama-server` for throughput panels. Nothing at all is needed for demo mode.
+and a reachable inference server for throughput panels. Nothing at all is needed for demo mode.
 
 On Windows 11, see [Windows](#windows) for setup; on a Mac, see
 [macOS](#macos). Prebuilt binaries for all three, on x86-64 and ARM64, are
@@ -448,8 +447,9 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | VRAM busy % | NVIDIA `utilization.memory` or AMD `mem_busy_percent` (memory-controller busy time) |
 | bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps, summed over every shard of a split file), expert tensors × used/total, embedding and engram tables excluded, split CPU vs GPU by what the cards hold, × steps/s |
 
-Per-request `timings` only appear inside completion responses, which the
-dashboard never sees, so everything is reconstructed from polled counters.
+For llama.cpp, per-request `timings` only appear inside completion responses,
+which the dashboard never sees, so they are reconstructed from polled counters.
+Strata instead exposes recent request summaries in `/metrics`; see below.
 
 ---
 
@@ -519,12 +519,91 @@ MTP.
 
 ---
 
+### Strata
+
+[Strata](https://github.com/Niko1221/Strata) exposes its Monitor tab as JSON
+at `GET /metrics`. No server patch, metrics flag, local GPU driver, or model
+file is required. For a server on another machine:
+
+```sh
+cargo install --path . --locked
+llm-visuals --endpoint http://inference-host:8098 --backend strata --log-db off
+```
+
+`--endpoint` alone also auto-detects Strata from the JSON metrics shape.
+`--model http://inference-host:8098/v1` works too. Local
+`python serve/server.py --engine strata` launchers are detected by process
+scan, including their `--host`, `--port` and `--config`. The HTTP launcher's
+default port is 8095; inference03 explicitly uses 8098. Its native child is
+folded into the launcher for GPU attribution, not polled as another server.
+A remote server must be selected by URL; the dashboard does not scan your network.
+
+The Strata view shows server-windowed decode and engine-measured mean prefill
+rates (with local display smoothing and history), model/context fill, prompt
+progress, state/phase and queued requests. For a remote endpoint, its hardware panel uses the
+**server's** GPU, PCIe, CPU, RAM and disk readings, never the monitoring
+machine's telemetry. A local process uses the mixed-GPU driver panels, with
+existing direct/inferred/configured placement labels. Its VRAM weight/KV split
+stays unknown because Strata offloads experts dynamically. It also shows KV mode/residency, expert-cache capacity
+and slots, free VRAM, speculative/MTP/lookup settings, conversation-cache
+capacity, prefix reuse and expert-cache hits from recent requests. Wider
+terminals include engine allocation settings and request RAM/file blob counts.
+Recent requests come directly from Strata, newest first, with measured prompt
+and decode rates/times and finish reasons.
+
+Verified against Strata **0.1.38**, with older 0.1.31 fixtures retained.
+Draft acceptance uses optional `drafts_accepted / drafts_offered` counters
+from completed requests and server totals. These are not live verification
+steps. Older versions without these fields show acceptance as unavailable.
+
+**Unavailable is not zero.** TTFT, live prefix reuse, verification-step counts
+and parked-conversation occupancy are not exported. `prompt_ms` is **prompt
+time**, not TTFT; configured conversation-cache slots are **capacity**, not
+occupancy. Expert `hit_rate` is not speculative acceptance or prompt-cache hit
+rate. Context explicitly describes the live request or the last completed
+request when idle/unloaded, not all resident conversations.
+
+The layer/expert zoom keys show architecture counts from a readable native
+GGUF header, found through the launcher's `--config` in its mount namespace.
+Published container ports retain their bind address, including LAN-only
+Docker proxies. Process placement identifies the serving GPU; per-layer placement and expert
+routing remain **not reported**. No activity tiles, memory split or bottleneck
+are invented. The model comparison key still compares both backends.
+
+| Strata display | JSON fields from `/metrics` |
+|---|---|
+| Model, window, context fill | `engine.model`, `engine.max_context` (`context` fallback); live `prompt_tokens + generated`, else last request `prompt_tokens + output_tokens` when idle |
+| Decode, prefill | `live.tok_s` (Strata's sliding window), `live.prefill_tok_s_mean`; `tok_s_mean` is also shown on tall terminals |
+| Phase, queue, progress | `live.state`, `phase`, `queued`, `elapsed_s`, `prompt_read`, `prompt_total`, `max_tokens` |
+| KV, experts, VRAM | `engine.kv`, `kv_resident`, `expert_cache_mib`, `expert_slots`, `expert_cache_primary_mib`, `expert_slots_primary`, `vram_free_mib` |
+| Spec/cache settings | `engine.spec`, `mtp_max`, `lookup`, `conversation_cache_mib`, `conversation_cache_slots`, `conversation_cache_min_free_mib`; allocation/settings line uses `arena_mib`, `pool_workers`, `pcie_frac`, `spec_min_p`, `cvec`, `version`, `images` |
+| Hardware | `hardware.gpu_*`, `cpu`, `ram_used`, `ram_total`, `disk_read_mb`, `disk_write_mb`; names/counts from `hardware_static`. Byte sizes are converted to GiB; PCIe/disk rates are MiB/s. Multi-GPU telemetry follows Strata's aggregation |
+| Draft acceptance | `requests[].drafts_offered`, `drafts_accepted`; `totals.drafts_offered`, `drafts_accepted`. Null/missing/invalid counts and zero denominators stay unknown |
+| Request history | `requests[].finish`, `prompt_tokens`, `reused`, `output_tokens`, `prompt_ms`, `decode_tok_s`, `duration_s`, `hit_rate`, `file_mb`, `ram_blobs`, `file_blobs`; prefill = `(prompt_tokens − reused) / (prompt_ms / 1000)` |
+| Server totals, tok/J | `totals.requests`, `prompt_tokens`, `reused`, `output_tokens`; tok/J = server decode rate / `hardware.gpu_power` |
+
+Missing/null/renamed fields read as `—`. Connection/read waits are bounded
+at 500/1500 ms. A failed or hung scrape retains the last successful snapshot
+with an amber **STALE** badge and its age. Stale samples do not extend rate or
+acceptance histories. The same poller recovers automatically, with a two-second
+backoff after three failures. Before the first successful scrape it shows
+metrics unavailable. SQLite model samples include Strata rates/context/server totals;
+Strata's historical requests are displayed but not imported into the SQLite
+request table, so polling does not fabricate TTFT or duplicate old requests.
+The SQLite GPU table continues to describe the dashboard host, not the remote
+server. Use `--log-db off` for a console-only session.
+
+Fork integration and deployment: [hajek.3 report](docs/strata-flash-release.md).
+Earlier live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
+Parser fixtures and provenance are described in [fixtures/README.md](fixtures/README.md).
+
 ## Command-line options
 
 ```
 --demo               synthetic servers and GPUs; exercises every panel
 --demo-models N      how many synthetic servers --demo runs (default 2)
 --endpoint <url>     inference server endpoint URL (e.g. http://localhost:7000/v1)
+--backend auto|strata explicit endpoint backend (default: auto)
 --model <id|url|auto>`auto` (default) observes running servers or local endpoints;
                      an HTTP URL attaches to that inference endpoint;
                      an HF id streams real attention via the Python bridge
@@ -622,8 +701,52 @@ the cause is visible.
 
 **AMD GPU panel is unavailable.** AMD telemetry requires Linux with the
 `amdgpu` driver and readable DRM sysfs/hwmon files under `/sys/class/drm`.
-No ROCm installation or privileged access is required. On other operating
+No ROCm installation or privileged access is required. Detected cards with
+unreadable telemetry remain visible as `unavailable`. On other operating
 systems the dashboard continues to use the existing NVIDIA collector.
+
+**Mixed NVIDIA / AMD / Intel hosts.** The panel collects all available vendors,
+with a combined backend label (for example `nvml+amd`). Dashboard GPU indices
+are allocated at startup: NVIDIA first (its existing indices), then AMD in
+DRM card-number order, then Intel. These indices stay fixed across telemetry
+failures and are the indices used by `--gpu`, models, and layer tiles.
+NVIDIA process memory comes from `nvidia-smi`; AMD placement comes from open
+DRM devices matched by PCI address and `/proc/<pid>/fdinfo` VRAM counters.
+Evidence held by the server or any descendant establishes **direct** placement.
+Repeated descriptors and inherited copies of a DRM client are counted once per
+server. Without fdinfo memory, an open render node still establishes placement,
+but per-process memory is unknown. Container device links are resolved through
+`/proc/<pid>/root` and host-visible device numbers/PIDs.
+
+If `/proc/<pid>/fd` is permission denied, and exactly one unplaced server and
+one GPU with VRAM in use remain after excluding other attributed servers, the
+dashboard shows **inferred** placement with its reason. This is elimination,
+not proof of ownership: unrelated GPU applications can invalidate that
+assumption. Multiple candidate GPUs or unplaced servers remain **unknown**,
+with the exact permission-denied path and an access hint. No privilege escalation
+or permission change is attempted. Inferred process memory is `not measured`;
+GPU VRAM remains driver-measured and the weight/KV split remains estimated.
+
+For an authoritative owner-supplied override, use repeatable
+`--server-gpu PORT=SELECTOR`, where the selector is a unique vendor (`amd`,
+`nvidia`, `intel`) or a PCI address exposed by the inventory, such as
+`pci:0000:01:00.0`. A router's public-port mapping also covers its descendants:
+
+```sh
+llm-visuals --server-gpu 8080=pci:0000:01:00.0 --log-db off
+LLM_VISUALS_SERVER_GPU='8080=amd,8098=nvidia' llm-visuals --log-db off
+```
+
+CLI mappings override environment mappings for the same port. Overrides are
+visibly **configured**, not measured evidence; ambiguous selectors are rejected.
+Bare llama.cpp routers are hidden beside loaded children unless explicitly
+selected by PID/endpoint. Unknown placement never borrows every vendor's
+activity; visibility masks alone do not establish use on a mixed host (including
+Intel masks). Pure NVIDIA and Intel hosts retain their affinity-mask fallback.
+`llm-visuals --version` and `-V` print the Cargo package version.
+Strata servers are recognized from their HTTP launcher and native child.
+Rates, context and recent requests come from Strata's JSON `/metrics`, never
+from llama.cpp probes. See [Strata](#strata) for field sources and limitations.
 
 **MTP panel says "start llama-server with --metrics".** Exactly that; see
 above.
@@ -693,6 +816,7 @@ src/
 ├── host.rs          /proc disk, faults, RSS; in-process NVML PCIe (dmon fallback)
 ├── fade.rs          smoothing and expert heat
 ├── observe.rs       /slots, /metrics, /experts parsers
+├── strata.rs        Strata JSON /metrics adapter, remote hardware and settings
 ├── gpu.rs           NVIDIA/AMD/Intel collectors, demo GPUs
 ├── nvml.rs          in-process NVML driver bindings & PCIe throughput
 ├── model_detect.rs  finds the servers, parses their command lines

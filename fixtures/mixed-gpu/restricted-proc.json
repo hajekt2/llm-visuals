@@ -1,0 +1,13 @@
+{
+  "description": "inference03 root-owned Docker llama.cpp, ordinary-user NVML reports Strata but procfs fd access is denied",
+  "llama_pid": 1721,
+  "llama_port": 34885,
+  "strata_pid": 1997,
+  "strata_port": 8098,
+  "fd_directory": "/proc/1721/fd",
+  "fd_read_error": "PermissionDenied",
+  "denied_reason": "permission denied reading /proc/1721/fd; needs server-user/root access",
+  "nvml_compute_apps": "GPU-3090, 2085, /opt/strata/build/strata, 23412\n",
+  "radeon_pci": "0000:01:00.0",
+  "radeon_vram_mb": 22228
+}

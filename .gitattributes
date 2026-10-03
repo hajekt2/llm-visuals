@@ -1,0 +1,2 @@
+# Preserve raw terminal/test captures, including their final blank lines.
+docs/mixed-gpu-verification/*.txt whitespace=-blank-at-eof

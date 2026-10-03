@@ -525,6 +525,7 @@ impl NvmlSession {
                 util_estimated: false,
                 pcie_gen,
                 pcie_width,
+                ..Default::default()
             });
         }
 

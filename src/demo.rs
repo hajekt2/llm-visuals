@@ -154,6 +154,7 @@ fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
         process_name: "llama-server".into(),
         engine: "llama.cpp".into(),
         gpu_indices: p.gpus.to_vec(),
+        placement: Default::default(),
         mem_used_mb: p.mem_used_mb,
         host: "127.0.0.1".into(),
         port: Some(8080 + idx as u16),

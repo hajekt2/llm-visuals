@@ -607,9 +607,97 @@ impl PerfTracker {
         }
     }
 
+    /// Strata supplies windowed rates and server-lifetime totals directly.
+    /// Its recent requests are rendered from /metrics, not reconstructed from
+    /// polling edges (which cannot measure TTFT or recover live prefix reuse).
+    fn observe_strata(&mut self, m: &crate::strata::StrataMetrics, now: Instant) {
+        let restarted = self
+            .last_sample
+            .as_ref()
+            .and_then(|(_, s)| s.strata.as_ref())
+            .is_some_and(|prev| {
+                prev.totals.get("since") != m.totals.get("since")
+                    || prev.engine.get("model") != m.engine.get("model")
+                    || crate::strata::number(&m.totals, "requests")
+                        .zip(crate::strata::number(&prev.totals, "requests"))
+                        .is_some_and(|(a, b)| a < b)
+            });
+        if restarted {
+            self.spec = SpecStats::new();
+        }
+        if let Some((draft_tokens, accepted)) = crate::strata::draft_counts(&m.totals) {
+            if draft_tokens < self.spec.totals.draft_tokens || accepted < self.spec.totals.accepted
+            {
+                self.spec = SpecStats::new();
+            }
+            self.observe_spec(
+                &SpecMetrics {
+                    draft_tokens,
+                    accepted,
+                    // Strata has no verification-step counter. The renderer must
+                    // not invent a tokens/step number from mtp_max or output count.
+                    ..Default::default()
+                },
+                now,
+            );
+        } else {
+            self.spec = SpecStats::new();
+        }
+        self.phase = match m.state() {
+            "reading" => Phase::Prefill,
+            "generating" => Phase::Decode,
+            _ => Phase::Idle,
+        };
+        self.decode_tps = m.decode_rate().unwrap_or(0.0);
+        self.prefill_tps = m.prefill_rate().unwrap_or(0.0);
+        let smooth =
+            |prev: f32, value: f32| prev + (value - prev) * if value > prev { 0.5 } else { 0.25 };
+        self.decode_tps_smooth = smooth(self.decode_tps_smooth, self.decode_tps);
+        self.prefill_tps_smooth = smooth(self.prefill_tps_smooth, self.prefill_tps);
+        self.peak_decode_tps = self.peak_decode_tps.max(self.decode_tps);
+        self.peak_prefill_tps = self.peak_prefill_tps.max(self.prefill_tps);
+        push(&mut self.decode_hist, self.decode_tps);
+        push(&mut self.prefill_hist, self.prefill_tps);
+        self.session_requests = crate::strata::number(&m.totals, "requests").unwrap_or(0.0) as u64;
+        self.session_decoded =
+            crate::strata::number(&m.totals, "output_tokens").unwrap_or(0.0) as u64;
+        self.session_prefilled = crate::strata::number(&m.totals, "prompt_tokens")
+            .zip(crate::strata::number(&m.totals, "reused"))
+            .map(|(prompt, reused)| (prompt - reused).max(0.0) as u64)
+            .unwrap_or(0);
+        // Do not attribute this remote server's energy to local GPUs.
+        self.total_power_w = crate::strata::number(&m.hardware, "gpu_power").unwrap_or(0.0) as f32;
+        let dt = self
+            .last_sample
+            .as_ref()
+            .map(|(t, _)| (now - *t).as_secs_f32())
+            .unwrap_or(0.0);
+        self.bw.decode.update(self.decode_tps, now, dt);
+        self.bw.prefill.update(self.prefill_tps, now, dt);
+    }
+
     pub fn observe(&mut self, s: &LiveStats, now: Instant) {
         self.samples += 1;
+        if let Some(m) = &s.strata {
+            if m.stale_for.is_some() {
+                // Keep the last rates, but do not add repeated stale samples
+                // to throughput/speculation windows or treat them as fresh.
+                self.poll_ok = false;
+                return;
+            }
+            self.poll_ok = true;
+            self.observe_strata(m, now);
+            self.last_sample = Some((now, s.clone()));
+            return;
+        }
         self.poll_ok = true;
+        if self
+            .last_sample
+            .as_ref()
+            .is_some_and(|(_, prev)| prev.strata.is_some())
+        {
+            self.spec = SpecStats::new();
+        }
         let Some((t0, prev)) = self.last_sample.clone() else {
             self.last_sample = Some((now, s.clone()));
             if s.processing {
@@ -654,7 +742,7 @@ impl PerfTracker {
                     // server's own timeline: TTFT + total inter-token
                     // time spans admission -> last token. `ended`
                     // keeps the detection time.
-                    if done.ttft.map_or(false, |t| t > 0.0) {
+                    if done.ttft.is_some_and(|t| t > 0.0) {
                         let e2e = close.ttft_secs + close.itl_sum;
                         if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                             done.started = st;
@@ -773,7 +861,7 @@ impl PerfTracker {
                 // total inter-token time is the request's true wall
                 // span (admission -> last token). llama.cpp rows have
                 // no histograms and keep the detection-based span.
-                if done.ttft.map_or(false, |t| t > 0.0) {
+                if done.ttft.is_some_and(|t| t > 0.0) {
                     let e2e = done.ttft.unwrap() as f64 + done.itl_sum.unwrap_or(0.0) as f64;
                     if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                         done.started = st;
@@ -814,6 +902,16 @@ impl PerfTracker {
         }
         self.total_power_w = gpus.iter().map(|g| g.power_watts).sum();
         self.bw.ensure_gpu(n, gpus);
+        // A rescan can move a server to another card. Historical traces
+        // remain valid, but stale current counters must not bind its verdict
+        // to a device it no longer holds.
+        for (i, meter) in self.bw.vram_busy.iter_mut().enumerate() {
+            if !gpus.iter().any(|g| g.index as usize == i) {
+                meter.update(0.0, now, dt);
+                self.bw.pcie_rx[i].update(0.0, now, dt);
+                self.bw.pcie_tx[i] = 0.0;
+            }
+        }
         for g in gpus {
             let i = g.index as usize;
             self.bw.vram_busy[i].update(g.utilization_mem, now, dt);
@@ -913,6 +1011,8 @@ mod tests {
     /// vLLM-shaped slot: counters jump only at completion; the
     /// optional `closing` view is what the adapter hands over when a
     /// completion and a successor's admission share one poll.
+    // Fixture mirrors the independent server counters used by these tests.
+    #[allow(clippy::too_many_arguments)]
     fn vllm_slot(
         id: i64,
         processing: bool,
@@ -1225,6 +1325,32 @@ mod tests {
             steps
         );
         assert!((p.bw.vram.value - 1.5 * steps).abs() < 1e-3);
+    }
+
+    #[test]
+    fn placement_changes_clear_unowned_current_counters() {
+        let now = Instant::now();
+        let mut p = PerfTracker::new();
+        p.observe_gpu(
+            &[GpuStats {
+                index: 0,
+                utilization_mem: 95.0,
+                ..Default::default()
+            }],
+            now,
+        );
+        p.bw.pcie_rx[0].update(1000.0, now, 0.2);
+        p.observe_gpu(
+            &[GpuStats {
+                index: 1,
+                utilization_mem: 20.0,
+                ..Default::default()
+            }],
+            now + Duration::from_millis(200),
+        );
+        assert_eq!(p.bw.vram_busy[0].value, 0.0);
+        assert_eq!(p.bw.pcie_rx[0].value, 0.0);
+        assert_eq!(p.bw.vram_busy[1].value, 20.0);
     }
 
     #[test]

@@ -21,7 +21,7 @@ impl GeneratedText {
     }
 
     /// Last 200 Unicode scalars of generated text (full string if a single status blob).
-    pub fn to_string(&self) -> String {
+    pub fn text(&self) -> String {
         let full: String = self.tokens.iter().map(|t| t.as_str()).collect();
         if self.tokens.len() == 1 && self.tokens[0].contains('\n') {
             return full;
@@ -154,7 +154,7 @@ mod tests {
     fn generated_text_truncates_on_char_boundary() {
         let mut t = GeneratedText::new();
         t.push(0, "é".repeat(250));
-        let s = t.to_string();
+        let s = t.text();
         assert_eq!(s.chars().count(), 200);
         assert!(s.is_char_boundary(0));
         assert!(s.is_char_boundary(s.len()));

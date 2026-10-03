@@ -13,9 +13,13 @@ pub mod nvml;
 mod observe;
 mod perf;
 mod pipeline;
+mod placement;
 mod render;
 mod settings;
 mod sglang;
+mod strata;
+#[cfg(all(test, target_os = "linux"))]
+mod test_support;
 mod vision;
 mod vllm;
 
@@ -84,6 +88,20 @@ impl ModelSlot {
         }
     }
 
+    fn observe_host(&mut self, sample: &HostSample, inventory: &[GpuStats], now: Instant) {
+        let mut sample = sample.clone();
+        sample.pcie_mb_s.retain(|(index, _, _)| {
+            self.model.uses_gpu(*index, inventory)
+                && inventory
+                    .iter()
+                    .any(|g| g.index == *index && matches!(g.backend, "nvml" | "smi" | ""))
+        });
+        if sample.pcie_mb_s.is_empty() {
+            sample.pcie_ok = false;
+        }
+        self.perf.observe_host(&sample, now);
+    }
+
     fn view(&self) -> ModelView<'_> {
         ModelView {
             detected: &self.model,
@@ -105,7 +123,11 @@ fn auth_for(model: &DetectedModel, fallback: &HttpAuth) -> HttpAuth {
 /// The servers to watch: everything detected, minus anything the `--pid`
 /// filter excludes, capped at `--max-models`. Returns detected models and an
 /// optional error note if an explicitly requested endpoint failed.
-async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
+async fn discover(
+    args: &Args,
+    auth: &HttpAuth,
+    inventory: &[GpuStats],
+) -> (Vec<DetectedModel>, Option<String>) {
     let filter = args.pid_filter();
     let mut explicit_models = Vec::new();
     let mut explicit_error = None;
@@ -115,7 +137,12 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     if let Some(ref ep) = explicit_ep {
         match model_detect::parse_endpoint(ep) {
             Ok((host, port, path)) => {
-                if let Some(m) = model_detect::probe_endpoint(&host, port, &path, auth).await {
+                let detected = if args.backend == "strata" {
+                    model_detect::probe_strata(&host, port, auth).await
+                } else {
+                    model_detect::probe_endpoint(&host, port, &path, auth).await
+                };
+                if let Some(m) = detected {
                     explicit_models.push(m);
                 } else {
                     explicit_error = Some(format!(
@@ -130,13 +157,52 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     }
 
     // 2. Scan processes for running LLM servers
-    let mut proc_models = model_detect::detect_models();
+    let mut proc_models = model_detect::detect_models(inventory);
+
+    if args.backend == "strata" {
+        proc_models.retain(|m| m.engine == "strata");
+    }
 
     // 3. If no models found by process scan and no explicit endpoint was configured,
     // probe local candidate endpoints (vLLM, llama.cpp, etc.)
     if proc_models.is_empty() && explicit_ep.is_none() {
-        proc_models = model_detect::probe_local_endpoints(auth).await;
+        proc_models = if args.backend == "strata" {
+            model_detect::probe_strata("127.0.0.1", strata::DEFAULT_PORT, auth)
+                .await
+                .into_iter()
+                .collect()
+        } else {
+            model_detect::probe_local_endpoints(auth).await
+        };
     }
+
+    let mappings = placement::mappings(
+        std::env::var("LLM_VISUALS_SERVER_GPU").ok().as_deref(),
+        &args.server_gpu,
+    );
+    if let Err(error) = placement::configure(
+        &mut proc_models,
+        inventory,
+        &mappings,
+        model_detect::parent_pid,
+    ) {
+        explicit_error = Some(error);
+    }
+    let mut keep = filter.clone();
+    keep.extend(
+        proc_models
+            .iter()
+            .filter(|m| {
+                explicit_models
+                    .iter()
+                    .any(|ep| ep.port.is_some() && ep.port == m.port)
+            })
+            .map(|m| m.pid),
+    );
+    model_detect::prune_redundant_routers(&mut proc_models, &keep);
+    // Use all detected servers as exclusion evidence before --pid or
+    // --max-models hides their cards from the monitored model list.
+    placement::infer_denied(&mut proc_models, inventory, placement::denied_reason);
 
     // Filter process-detected models by PID if requested (exempt explicitly requested endpoints)
     if !filter.is_empty() {
@@ -147,19 +213,22 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
     let mut found = explicit_models;
     for m in proc_models {
         let duplicate = found.iter_mut().find(|fm| {
-            (fm.port.is_some() && fm.port == m.port) || (!fm.name.is_empty() && fm.name == m.name)
+            (fm.host == m.host
+                || (model_detect::is_local_host(&fm.host) && model_detect::is_local_host(&m.host)))
+                && ((fm.port.is_some() && fm.port == m.port)
+                    || (fm.port.is_none()
+                        && m.port.is_none()
+                        && !fm.name.is_empty()
+                        && fm.name == m.name))
         });
         if let Some(fm) = duplicate {
-            let is_loopback = matches!(
-                fm.host.as_str(),
-                "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" | "[::1]"
-            );
-            if is_loopback {
+            if model_detect::is_local_host(&fm.host) {
                 if fm.pid == 0 {
                     fm.pid = m.pid;
                 }
                 if fm.gpu_indices.is_empty() {
                     fm.gpu_indices = m.gpu_indices;
+                    fm.placement = m.placement;
                 }
                 if fm.mem_used_mb == 0 {
                     fm.mem_used_mb = m.mem_used_mb;
@@ -173,7 +242,7 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
                     && fm
                         .vision
                         .as_ref()
-                        .map_or(true, |v| v.place == vision::Place::Unknown)
+                        .is_none_or(|v| v.place == vision::Place::Unknown)
                 {
                     fm.vision = m.vision;
                 }
@@ -187,7 +256,28 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
             found.push(m);
         }
     }
+    // Also support explicitly probed endpoints that have no host PID. These
+    // can be configured, never eliminated without a denied local process.
+    if let Err(error) =
+        placement::configure(&mut found, inventory, &mappings, model_detect::parent_pid)
+    {
+        explicit_error = Some(error);
+    }
     found.truncate(args.max_models.max(1));
+    for model in &mut found {
+        if model.engine == "strata" && model.pid != 0 {
+            if let Some(port) = model.port {
+                if let Some(info) =
+                    model_detect::probe_strata(&model.host, port, &auth_for(model, auth)).await
+                {
+                    if info.name != format!("strata-{port}") {
+                        model.name = info.name;
+                    }
+                    model.ctx_max = info.ctx_max.or(model.ctx_max);
+                }
+            }
+        }
+    }
     // `llama-server -hf owner/repo:quant` does not put a local GGUF path on
     // its command line. Current llama.cpp exposes the resolved path via
     // `/props`; use it so layer counts and tensor layout remain available.
@@ -275,6 +365,43 @@ async fn poll_server(
 ) {
     let PollContext { others, auth } = context;
     let pid = model.key();
+    if model.engine == "strata" {
+        let mut adapter = strata::StrataAdapter::default();
+        let mut misses = 0u32;
+        let mut last_good: Option<(Instant, LiveStats)> = None;
+        loop {
+            // http_get bounds connection/read waits to 500/1500 ms. Strata
+            // can block its metrics handler while busy; retain labelled data.
+            let stats = match strata::poll_metrics(&model.host, port, &auth).await {
+                Some(m) => {
+                    misses = 0;
+                    let stats = adapter.observe(m);
+                    last_good = Some((Instant::now(), stats.clone()));
+                    stats
+                }
+                None => {
+                    misses = misses.saturating_add(1);
+                    let mut stats = last_good
+                        .as_ref()
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_default();
+                    if let (Some((at, _)), Some(m)) = (&last_good, &mut stats.strata) {
+                        m.stale_for = Some(at.elapsed());
+                    }
+                    stats
+                }
+            };
+            if live_tx.send((pid, stats)).await.is_err() {
+                return;
+            }
+            let delay = if misses >= 3 {
+                poll.max(Duration::from_secs(2))
+            } else {
+                poll.max(Duration::from_millis(400))
+            };
+            tokio::time::sleep(delay).await;
+        }
+    }
     if model.engine == "sglang" {
         // SGLang has no /slots. /v1/loads is always on; /server_info is
         // fetched once at attach. Each poll is a line in SGLang's access
@@ -475,7 +602,7 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
     match slots.len() {
         0 => format!(
-            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang) — press r to rescan"
+            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang / Strata) — press r to rescan"
         ),
         1 => format!("{prefix}attached to {}", slots[0].model),
         n => format!(
@@ -502,10 +629,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut theme_name = args.theme.clone();
     let theme = colors::get_theme(&theme_name);
 
+    // Discovery and polling share one index space, fixed before any process scan.
+    let gpu_backend = (!args.demo).then(|| {
+        Arc::new(GpuBackend::detect(if args.no_nvml {
+            None
+        } else {
+            nvml::NvmlSession::new()
+        }))
+    });
+    let inventory = gpu_backend
+        .as_ref()
+        .map(|b| b.inventory())
+        .unwrap_or_default();
+    let nvml_host = gpu_backend.as_ref().and_then(|b| b.nvml());
+    let backend_name = gpu_backend
+        .as_ref()
+        .map(|b| b.name())
+        .unwrap_or_else(|| "demo".into());
+
     let (discovered, endpoint_err) = if args.demo {
         (demo::demo_models(DEMO_CTX, args.demo_models), None)
     } else {
-        discover(&args, &auth).await
+        discover(&args, &auth, &inventory).await
     };
     let mut slots: Vec<ModelSlot> = discovered.into_iter().map(ModelSlot::new).collect();
     let mut focus: usize = 0;
@@ -593,23 +738,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_filter = args.gpu_indices();
     let mut poll = Duration::from_millis(args.poll_ms.max(50));
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
-
-    let (gpu_backend, nvml_host, backend_name) = if args.demo {
-        (None, None, "demo")
-    } else {
-        let nvml = if args.no_nvml {
-            None
-        } else {
-            nvml::NvmlSession::new()
-        };
-        let backend = Arc::new(GpuBackend::detect(nvml));
-        let nvml_host = match backend.as_ref() {
-            GpuBackend::Nvml(session) => Some(session.clone()),
-            _ => None,
-        };
-        let name = backend.name();
-        (Some(backend), nvml_host, name)
-    };
 
     if args.demo {
         let n = if gpu_filter.is_empty() {
@@ -838,7 +966,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h.abort();
             }
             // Keep the counters of models that are still up.
-            let (found, rescan_err) = discover(&args, &auth).await;
+            // Elimination needs current VRAM, not the cached startup snapshot.
+            // A failed poll retains identity but cannot supply inference evidence.
+            let current_inventory = gpu_backend
+                .as_ref()
+                .and_then(|b| b.collect().ok())
+                .unwrap_or_else(|| {
+                    inventory
+                        .iter()
+                        .cloned()
+                        .map(|mut g| {
+                            g.mem_used_mb = 0;
+                            g.telemetry_error = Some("GPU poll unavailable".into());
+                            g
+                        })
+                        .collect()
+                });
+            let (found, rescan_err) = discover(&args, &auth, &current_inventory).await;
             let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
             for m in found {
                 match slots.iter().position(|s| s.model.key() == m.key()) {
@@ -905,7 +1049,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gpu_updated {
             // The cards are shared, so every model sees the same samples.
             for slot in &mut slots {
-                slot.perf.observe_gpu(&latest_gpu, now);
+                let owned: Vec<_> = latest_gpu
+                    .iter()
+                    .filter(|g| slot.model.uses_gpu(g.index, &latest_gpu))
+                    .cloned()
+                    .collect();
+                slot.perf.observe_gpu(&owned, now);
             }
         }
         for slot in &mut slots {
@@ -939,10 +1088,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui_changed = true;
             for (pid, h) in batch {
                 if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
-                    slot.perf.observe_host(&h, now);
+                    slot.observe_host(&h, &latest_gpu, now);
                 } else if pid == 0 {
                     for slot in &mut slots {
-                        slot.perf.observe_host(&h, now);
+                        slot.observe_host(&h, &latest_gpu, now);
                     }
                 }
             }
@@ -952,6 +1101,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                 if s.ctx_max > 0 {
                     slot.ctx_max = s.ctx_max;
+                }
+                if let Some(m) = &s.strata {
+                    if let Some(name) =
+                        strata::text(&m.engine, "model").filter(|name| !name.is_empty())
+                    {
+                        slot.model.name = name.to_string();
+                    }
+                    if let Some(ctx) = m.context_max() {
+                        slot.model.ctx_max = Some(ctx);
+                    }
+                    // /metrics reports image support, not the encoder device.
+                    match m.engine.get("images").and_then(serde_json::Value::as_bool) {
+                        Some(false) => slot.model.vision = None,
+                        Some(true) if slot.model.vision.is_none() => {
+                            slot.model.vision = Some(vision::Vision {
+                                loaded: None,
+                                place: vision::Place::Unknown,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 slot.perf.observe(&s, now);
                 slot.live = s;
@@ -1055,7 +1225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             detected: cur.map(|v| v.detected),
             gpus: &latest_gpu,
             gpu_error: gpu_error.as_deref(),
-            gpu_backend: Some(backend_name),
+            gpu_backend: Some(&backend_name),
             fade: cur.map(|v| v.fade).unwrap_or(&empty_fade),
             perf: cur.map(|v| v.perf).unwrap_or(&empty_perf),
             live: cur.map(|v| v.live).unwrap_or(&empty_live),
@@ -1138,14 +1308,28 @@ fn fade_sample_from_live(
     }
     let n_layers = n_layers.max(1);
     let model_gpus: Vec<u32> = detected.map(|d| d.gpu_indices.clone()).unwrap_or_default();
+    let unknown_placement = detected.is_some() && model_gpus.is_empty() && gpu::is_mixed(gpu);
     let layer_gpu: Vec<usize> = (0..n_layers)
-        .map(|l| layer_device(l, n_layers, &split, &model_gpus))
+        .map(|l| {
+            if unknown_placement {
+                gpu::UNKNOWN_GPU
+            } else {
+                layer_device(l, n_layers, &split, &model_gpus)
+            }
+        })
         .collect();
     let processing = live.processing;
     let layer_target: Vec<f32> = (0..n_layers)
         .map(|l| {
             let dev = layer_gpu[l];
-            let u = util.get(dev).copied().unwrap_or(0.0) / 100.0;
+            if dev == gpu::UNKNOWN_GPU {
+                return 0.0;
+            }
+            let u = if detected.is_some_and(|m| !m.uses_gpu(dev as u32, gpu)) {
+                0.0
+            } else {
+                util.get(dev).copied().unwrap_or(0.0) / 100.0
+            };
             if processing {
                 u.clamp(0.08, 1.0)
             } else {
@@ -1176,7 +1360,6 @@ fn fade_sample_from_live(
         })
         .or_else(|| detected.map(|d| d.mem_used_mb))
         .unwrap_or(0);
-    let split_sum: f32 = split.iter().copied().sum::<f32>().max(1.0);
     let mut weight_frac = vec![0.0f32; n_gpus];
     let mut kv_alloc_frac = vec![0.0f32; n_gpus];
     // Placement, not the weight estimate: a model whose size is unknown
@@ -1187,24 +1370,11 @@ fn fade_sample_from_live(
         if i >= n_gpus {
             continue;
         }
-        let share = if !split.is_empty() {
-            split.get(i).copied().unwrap_or(0.0) / split_sum
-        } else if let Some(idxs) =
-            detected.and_then(|d| (!d.gpu_indices.is_empty()).then_some(d.gpu_indices.as_slice()))
-        {
-            // Engine told us which GPUs it actually uses (e.g. one-GPU
-            // vLLM serve): spread evenly over those, zero elsewhere.
-            let own = idxs.iter().filter(|&&g| g as usize == i).count();
-            if own > 0 {
-                1.0 / idxs.len().max(1) as f32
-            } else {
-                0.0
-            }
-        } else {
-            // Unknown layout: assume it spans every visible GPU.
-            1.0 / gpu.len().max(1) as f32
-        };
+        let share = detected.map(|m| m.gpu_share(g.index, gpu)).unwrap_or(0.0);
         model_owned[i] = share > 0.0;
+        if share <= 0.0 {
+            continue;
+        }
         let used_f = if g.mem_total_mb == 0 {
             0.0
         } else {
@@ -1255,6 +1425,102 @@ mod tests {
     use clap::Parser;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
+        super::discover(args, auth, &[]).await
+    }
+
+    #[tokio::test]
+    async fn strata_process_model_starts_metrics_poller() {
+        let (port, _shutdown) =
+            spawn_mock_server("{}", include_str!("../fixtures/strata-metrics-0.1.38.json")).await;
+        let mut model = demo::demo_models(8192, 1).remove(0);
+        model.engine = "strata".into();
+        model.host = "127.0.0.1".into();
+        model.port = Some(port);
+        let key = model.key();
+        let (live, mut samples) = mpsc::channel(1);
+        let (spec, _) = mpsc::channel(1);
+        let (experts, _) = mpsc::channel(1);
+        let handles = spawn_pollers(
+            &[model],
+            &live,
+            &spec,
+            &experts,
+            Duration::from_millis(200),
+            &HttpAuth::default(),
+        );
+        assert_eq!(handles.len(), 1);
+        let (pid, stats) = tokio::time::timeout(Duration::from_secs(3), samples.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for handle in handles {
+            handle.abort();
+        }
+        assert_eq!(pid, key);
+        assert_eq!(stats.ctx_max, 262144);
+        assert_eq!(stats.strata.unwrap().requests.len(), 12);
+    }
+
+    #[test]
+    fn mixed_host_weights_kv_and_layers_stay_on_the_serving_gpu() {
+        let mut model = demo::demo_models(8192, 1).remove(0);
+        model.gpu_indices = vec![1];
+        model.tensor_split = vec![1.0];
+        let gpus = vec![
+            GpuStats {
+                index: 0,
+                backend: "nvml",
+                mem_total_mb: 24_576,
+                mem_used_mb: 9_000,
+                utilization_gpu: 99.0,
+                ..Default::default()
+            },
+            GpuStats {
+                index: 1,
+                backend: "amd",
+                mem_total_mb: 24_576,
+                mem_used_mb: 16_384,
+                utilization_gpu: 10.0,
+                ..Default::default()
+            },
+        ];
+        let live = LiveStats {
+            processing: true,
+            weight_gb: Some(12.0),
+            kv_cache_gb: Some(4.0),
+            ..Default::default()
+        };
+        let sample = fade_sample_from_live(Some(&model), &gpus, &live, 8);
+        assert_eq!(sample.model_owned, vec![false, true]);
+        assert_eq!(sample.weight_frac, vec![0.0, 0.5]);
+        assert_eq!(sample.kv_alloc_frac[0], 0.0);
+        assert!(sample.kv_alloc_frac[1] > 0.0);
+        assert!(sample.layer_gpu.iter().all(|&g| g == 1));
+        assert!(sample.layer_target.iter().all(|&u| (u - 0.1).abs() < 0.001));
+        // No fd / process evidence: do not borrow the NVIDIA card's 99%.
+        model.gpu_indices.clear();
+        let sample = fade_sample_from_live(Some(&model), &gpus, &live, 8);
+        assert_eq!(sample.model_owned, vec![false, false]);
+        assert_eq!(sample.weight_frac, vec![0.0, 0.0]);
+        assert_eq!(sample.kv_alloc_frac, vec![0.0, 0.0]);
+        assert!(sample.layer_gpu.iter().all(|&g| g == gpu::UNKNOWN_GPU));
+        assert!(sample.layer_target.iter().all(|&u| u == 0.0));
+        model.gpu_indices = vec![1];
+        let mut slot = ModelSlot::new(model);
+        slot.observe_host(
+            &HostSample {
+                pcie_mb_s: vec![(0, 500.0, 100.0)],
+                pcie_ok: true,
+                ..Default::default()
+            },
+            &gpus,
+            Instant::now(),
+        );
+        assert!(slot.perf.bw.host.pcie_mb_s.is_empty());
+        assert!(!slot.perf.bw.host.pcie_ok);
+    }
 
     #[test]
     fn dir_model_bytes_sums_weight_shards_only() {
@@ -1351,6 +1617,130 @@ mod tests {
             }
         });
         (port, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn strata_auto_and_explicit_discovery() {
+        for backend in ["auto", "strata"] {
+            let (port, _shutdown) =
+                spawn_mock_server("{}", include_str!("../fixtures/strata-idle.json")).await;
+            let ep = format!("http://127.0.0.1:{port}");
+            let args =
+                Args::try_parse_from(["llm-visuals", "--endpoint", &ep, "--backend", backend])
+                    .unwrap();
+            let (models, err) = discover(&args, &HttpAuth::default()).await;
+            assert!(err.is_none(), "{err:?}");
+            let m = models.iter().find(|m| m.port == Some(port)).unwrap();
+            assert_eq!(m.engine, "strata");
+            assert_eq!(m.name, "Qwen3.8-Flash-Next-IQ3_S");
+            assert_eq!(m.ctx_max, Some(262144));
+        }
+    }
+
+    #[tokio::test]
+    async fn strata_poller_retains_labelled_stale_data_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stage = Arc::new(AtomicUsize::new(0));
+        let state = stage.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /metrics HTTP/1.1"));
+                if state.load(Ordering::SeqCst) == 3 {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        drop(stream);
+                    });
+                    continue;
+                }
+                let (status, body) = match state.load(Ordering::SeqCst) {
+                    0 => ("200 OK", include_str!("../fixtures/strata-busy.json")),
+                    1 => (
+                        "503 Service Unavailable",
+                        include_str!("../fixtures/strata-error.json"),
+                    ),
+                    _ => ("200 OK", include_str!("../fixtures/strata-idle.json")),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let model = model_detect::probe_strata("127.0.0.1", port, &HttpAuth::default())
+            .await
+            .unwrap();
+        let (live_tx, mut live_rx) = mpsc::channel(16);
+        let (spec_tx, _) = mpsc::channel(16);
+        let (expert_tx, _) = mpsc::channel(16);
+        let task = tokio::spawn(poll_server(
+            model,
+            port,
+            live_tx,
+            spec_tx,
+            expert_tx,
+            PollContext {
+                others: vec![],
+                auth: HttpAuth::default(),
+            },
+            Duration::from_millis(200),
+        ));
+        let (_, live) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(live.processing && live.strata.is_some());
+        stage.store(1, Ordering::SeqCst);
+        loop {
+            let (_, s) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if s.strata.as_ref().is_some_and(|m| m.stale_for.is_some()) {
+                assert!(s.processing);
+                assert_eq!(s.ctx_used(), live.ctx_used());
+                assert_eq!(
+                    s.strata.as_ref().unwrap().requests.len(),
+                    live.strata.as_ref().unwrap().requests.len()
+                );
+                break;
+            }
+        }
+        // A hung handler also produces stale samples within the short timeout.
+        stage.store(3, Ordering::SeqCst);
+        loop {
+            let (_, s) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if s.strata
+                .as_ref()
+                .and_then(|m| m.stale_for)
+                .is_some_and(|age| age >= Duration::from_secs(1))
+            {
+                assert!(s.processing);
+                break;
+            }
+        }
+        // The same poller and endpoint recover without a rescan or new task.
+        stage.store(2, Ordering::SeqCst);
+        loop {
+            let (_, s) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if s.strata.as_ref().is_some_and(|m| m.stale_for.is_none()) {
+                assert!(!s.processing);
+                break;
+            }
+        }
+        task.abort();
+        server.abort();
     }
 
     #[tokio::test]

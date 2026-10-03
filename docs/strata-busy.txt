@@ -1,0 +1,46 @@
+╭ ◆ LLM VISUALS ──────────────────────────────────────────────────────────────────────────────────────────────────── ⠙ DECODE  up 00:00:31  00:05:30 ╮
+│ Qwen3.8-Flash-Next-IQ3_S  ·  strata pid 0                                                                                                          │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ ◆ THROUGHPUT ───────────────────────────────────────────────╮╭ ◆ SERVER HARDWARE · /metrics ───────────────────────────────────────────────────────╮
+│▄█  ▄ ▄   ▀▀▄  tok/s       prefill 18.9 tok/s                ││NVIDIA GeForce RTX 3090 · 1 GPU(s)                                                   │
+│ █  ▀▀█   ▄▀   DECODE      ttft    —                         ││GPU 100% · 46 °C · 161.4 / 250 W                                                     │
+│▀▀▀   ▀ ▄ ▀▀▀  peak 22.5   tok/J   0.14                      ││VRAM 23.4 / 24.0 GiB · engine free 739 MiB                                           │
+│server totals: 24 req · 2827 gen                             ││PCIe RX 1768.9 · TX 250.1 MiB/s · gen 4 x16                                          │
+│decode 22.5 · prefill 20.1 tok/s (server)                    ││CPU 92.6% · RAM 28.7 / 47.0 GiB                                                      │
+│decode                                                      █││Disk read 574.1 · write 0.0 MiB/s                                                    │
+│                                                           ▁█││AMD Ryzen 9 9900X 12-Core Processor · 12 cores / 12 threads                          │
+│                                                           ██││                                                                                     │
+│   22.5 ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁██││                                                                                     │
+│prefill ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▂▂▂││                                                                                     │
+╰─────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────────────────────╯
+╭ ◆ STRATA · CONTEXT / CACHES / ENGINE ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│generating · thinking · queued 0 · elapsed 3.7 s · TTFT unavailable                                                                                 │
+│Context 74 / 262,144 (0.0%) [live] · prompt progress — / —                                                                                          │
+│KV int8 · resident 0 · expert cache 13517 MiB / 6958 slots                                                                                          │
+│Spec 6 · MTP max 4 · lookup 3 · acceptance unavailable                                                                                              │
+│Conversation cache capacity 6144 MiB / 2 slots · parked count unavailable                                                                           │
+│Last prompt reuse 989 / 996 · expert hit 73.4% · version 0.1.31                                                                                     │
+│Totals: 1352806 prompt · 1040266 reused · 2827 gen · 24 requests                                                                                    │
+│Arena 20479 MiB · workers 11 · PCIe frac 0.55 · spec min p 0.50 · cvec 0                                                                            │
+│Primary expert cache 13517 MiB / 6958 slots · cache RAM floor 4096 MiB                                                                              │
+│Decode mean 21.9 tok/s · max output 128 · images false                                                                                              │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ ◆ STRATA · RECENT REQUESTS · newest first ─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│finish     prompt   reused   output   pre t/s   dec t/s  prompt s  total s   hit%  file MiB                                                         │
+│length        996      989      128      16.0      47.4      0.44      3.1   73.4   11118.6                                                         │
+│stop        96146    94394      889     212.5      43.4      8.25     28.7   89.1   41937.5                                                         │
+│length        996        0      128     398.2      56.3      2.50      4.8   77.7    7629.2                                                         │
+│stop        94223    93994      171     154.0      52.2      1.49      4.8   76.2   11980.6                                                         │
+│stop        14855        0       21     806.8      50.1     18.41     18.8   76.1    1306.4                                                         │
+│stop           61        0      114      20.2      37.2      3.02      6.1   76.0    8839.8                                                         │
+│stop        93489    93133      506     209.0      42.6      1.70     13.6   80.7   26717.2                                                         │
+│stop        93138    93094      328      64.4      52.8      0.68      6.9   80.2   18471.6                                                         │
+│stop        92830    92778      265      81.6      49.1      0.64      6.0   81.5   15924.5                                                         │
+│stop        92680    92665       97      83.1      39.5      0.18      2.6   74.3    6345.7                                                         │
+│stop        92650    92629       14      72.7      56.2      0.29      0.5   94.8     335.6                                                         │
+│stop        92614    92573       16      19.1      45.4      2.14      2.5   93.1     372.6                                                         │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+│                                                                                                                                                    │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ q quit a all p perf h layers m experts b bandwidth t theme:defrag s settings l log c ctx speed r rescan attached to Qwen3.8-Flash-Next-IQ3_…  24-bit

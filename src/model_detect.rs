@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::gguf::{self, GgufInfo};
+use crate::gpu::GpuStats;
 use crate::vision::{self, Place, Vision};
 
 /// Information about a detected running LLM process
@@ -13,6 +14,7 @@ pub struct DetectedModel {
     pub process_name: String,
     pub engine: String,
     pub gpu_indices: Vec<u32>,
+    pub placement: crate::placement::Placement,
     pub mem_used_mb: u64,
     /// Address the pollers dial. A wildcard bind (`0.0.0.0`, `::`) stays
     /// on loopback, which can still reach it. A specific `--host` is kept,
@@ -43,6 +45,15 @@ impl std::fmt::Display for DetectedModel {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        if self.engine == "strata" && self.pid == 0 {
+            return write!(
+                f,
+                "{} ({}:{} · strata)",
+                self.name,
+                self.host,
+                self.port.unwrap_or(crate::strata::DEFAULT_PORT)
+            );
+        }
         if self.pid == 0 {
             if let Some(port) = self.port {
                 write!(
@@ -104,9 +115,72 @@ impl DetectedModel {
         parts.join("-")
     }
 
-    /// Whether this looks like a bare daemon with nothing loaded.
+    /// Estimated weight share, constrained by observed placement. A visibility
+    /// mask or a tensor split must never claim an unrelated vendor's VRAM.
+    pub fn gpu_share(&self, index: u32, gpus: &[GpuStats]) -> f32 {
+        if self.n_gpu_layers == Some(0) {
+            return 0.0;
+        }
+        let position = if self.gpu_indices.is_empty() {
+            if crate::gpu::is_mixed(gpus) {
+                return 0.0;
+            }
+            index as usize
+        } else {
+            let Some(position) = self.gpu_indices.iter().position(|&g| g == index) else {
+                return 0.0;
+            };
+            position
+        };
+        if self.tensor_split.is_empty() {
+            let count = if self.gpu_indices.is_empty() {
+                gpus.len()
+            } else {
+                self.gpu_indices.len()
+            };
+            return 1.0 / count.max(1) as f32;
+        }
+        let active: Vec<f32> = self
+            .tensor_split
+            .iter()
+            .copied()
+            .filter(|s| *s > 0.0)
+            .collect();
+        let split = if !self.gpu_indices.is_empty() && active.len() == self.gpu_indices.len() {
+            &active
+        } else {
+            &self.tensor_split
+        };
+        split.get(position).copied().unwrap_or(0.0) / split.iter().sum::<f32>().max(1.0)
+    }
+
+    pub fn uses_gpu(&self, index: u32, gpus: &[GpuStats]) -> bool {
+        self.n_gpu_layers != Some(0)
+            && if self.gpu_indices.is_empty() {
+                !crate::gpu::is_mixed(gpus)
+            } else {
+                self.gpu_indices.contains(&index)
+            }
+    }
+
+    fn is_llama_router(&self) -> bool {
+        self.engine == "llama.cpp"
+            && self.cmdline.split_whitespace().any(|arg| {
+                matches!(
+                    arg.split('=').next(),
+                    Some("--models-preset" | "--models-dir")
+                )
+            })
+    }
+
+    /// Keep routers until public-port configuration and child deduplication.
+    /// Otherwise restricted /proc would hide the only 8080 mapping target.
     fn is_idle_daemon(&self) -> bool {
-        self.mem_used_mb == 0 && self.path.is_none() && self.gguf.is_none()
+        self.engine != "strata"
+            && self.mem_used_mb == 0
+            && self.path.is_none()
+            && self.gguf.is_none()
+            && !self.is_llama_router()
     }
 
     pub fn n_layers(&self) -> usize {
@@ -230,11 +304,7 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
             continue;
         }
         let mp = unescape_mount(f[4]);
-        if target.starts_with(&mp)
-            && best
-                .as_ref()
-                .map_or(true, |(_, _, bmp)| mp.len() > bmp.len())
-        {
+        if target.starts_with(&mp) && best.as_ref().is_none_or(|(_, _, bmp)| mp.len() > bmp.len()) {
             best = Some((f[2].to_string(), unescape_mount(f[3]), mp));
         }
     }
@@ -248,7 +318,7 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
         let f: Vec<&str> = line.splitn(6, ' ').collect();
         if f.len() >= 6 && f[2] == dev {
             let hmp = unescape_mount(f[4]);
-            if host_prefix.as_ref().map_or(true, |p| hmp.len() > p.len()) {
+            if host_prefix.as_ref().is_none_or(|p| hmp.len() > p.len()) {
                 host_prefix = Some(hmp);
             }
         }
@@ -366,13 +436,13 @@ fn ppid_from_stat(txt: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn parent_pid(pid: u32) -> Option<u32> {
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     let txt = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     ppid_from_stat(&txt)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn parent_pid(_pid: u32) -> Option<u32> {
+pub(crate) fn parent_pid(_pid: u32) -> Option<u32> {
     None
 }
 
@@ -412,22 +482,32 @@ fn resolve_container_host_port(
     cmdline_port: Option<u16>,
     default_port: u16,
 ) -> Option<u16> {
+    resolve_container_endpoint(pid, cmdline_port, default_port).map(|(_, port)| port)
+}
+
+/// Preserve the published bind address too: a LAN-only proxy does not answer
+/// on loopback even though its container server listens on 0.0.0.0.
+fn resolve_container_endpoint(
+    pid: u32,
+    cmdline_port: Option<u16>,
+    default_port: u16,
+) -> Option<(Option<String>, u16)> {
     let own = match std::fs::read_link("/proc/self/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => return cmdline_port,
+        Err(_) => return cmdline_port.map(|port| (None, port)),
     };
     let server = match std::fs::read_link(format!("/proc/{pid}/ns/net")) {
         Ok(p) => p.to_string_lossy().into_owned(),
         // Same namespace as us (or unreadable): the command-line port is
         // already a host port.
-        Err(_) => return cmdline_port,
+        Err(_) => return cmdline_port.map(|port| (None, port)),
     };
     if server == own {
-        return cmdline_port.or(Some(default_port));
+        return Some((None, cmdline_port.unwrap_or(default_port)));
     }
     let ips = netns_ipv4s(pid)?;
     if ips.is_empty() {
-        return cmdline_port;
+        return cmdline_port.map(|port| (None, port));
     }
     let dir = std::fs::read_dir("/proc").ok()?;
     for ent in dir.flatten() {
@@ -450,46 +530,34 @@ fn resolve_container_host_port(
                 .collect(),
             _ => continue,
         };
-        let mut container_ip: Option<String> = None;
-        let mut container_port: Option<u16> = None;
-        let mut host_port: Option<u16> = None;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-container-ip" => {
-                    if let Some(v) = args.get(i + 1) {
-                        container_ip = Some(v.clone());
-                        i += 1;
-                    }
-                }
-                "-container-port" => {
-                    if let Some(v) = args.get(i + 1) {
-                        container_port = v.parse().ok();
-                        i += 1;
-                    }
-                }
-                "-host-port" => {
-                    if let Some(v) = args.get(i + 1) {
-                        host_port = v.parse().ok();
-                        i += 1;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        // A container can publish several ports (one docker-proxy each,
-        // all sharing the container IP); only the mapping whose container
-        // side is the server's own port is ours.
-        if let (Some(ip), Some(port)) = (&container_ip, host_port) {
-            if ips.iter().any(|x| x == ip)
-                && container_port == Some(cmdline_port.unwrap_or(default_port))
-            {
-                return Some(port);
-            }
+        if let Some(endpoint) = proxy_endpoint(&args, &ips, cmdline_port.unwrap_or(default_port)) {
+            return Some(endpoint);
         }
     }
-    cmdline_port
+    cmdline_port.map(|port| (None, port))
+}
+
+/// A container can publish several ports and bind only one LAN address.
+/// Match its IP and internal server port before using the host endpoint.
+fn proxy_endpoint(
+    args: &[String],
+    ips: &[String],
+    server_port: u16,
+) -> Option<(Option<String>, u16)> {
+    let value = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    };
+    let ip = value("-container-ip")?;
+    let port: u16 = value("-container-port")?.parse().ok()?;
+    if !ips.iter().any(|candidate| candidate == ip) || port != server_port {
+        return None;
+    }
+    Some((
+        value("-host-ip").map(connect_host),
+        value("-host-port")?.parse().ok()?,
+    ))
 }
 
 /// The IPv4 addresses bound inside a process's network namespace, read
@@ -542,30 +610,19 @@ fn is_ipv4(s: &str) -> bool {
 /// Scan GPU compute apps + process cmdlines for inference servers.
 /// Every server found is returned, best first; the caller decides how many
 /// to monitor.
-pub fn detect_models() -> Vec<DetectedModel> {
-    let mut gpu_procs = nvidia_compute_apps();
-    if gpu_procs.is_empty() {
-        gpu_procs = amd_compute_apps();
-    }
+pub fn detect_models(inventory: &[GpuStats]) -> Vec<DetectedModel> {
+    let mut gpu_procs = nvidia_compute_apps(inventory);
+    gpu_procs.extend(amd_compute_apps(inventory));
     let mut by_pid: std::collections::HashMap<u32, DetectedModel> =
         std::collections::HashMap::new();
-    // SGLang workers hold the GPU memory; fold it onto the launcher PID.
-    let mut worker_gpu: std::collections::HashMap<u32, (u64, Vec<u32>)> =
-        std::collections::HashMap::new();
-
-    for app in gpu_procs {
+    // Placement is applied after the process scan and adapter folding, so a
+    // GPU-owning child is evidence for every detected server in its ancestry.
+    for app in &gpu_procs {
         let cmdline = read_cmdline(app.pid).unwrap_or_else(|| app.process_name.clone());
-        if is_sglang_worker(&app.process_name) {
-            if let Some(ppid) = parent_pid(app.pid) {
-                let e = worker_gpu.entry(ppid).or_insert((0, Vec::new()));
-                e.0 = e.0.saturating_add(app.mem_used_mb);
-                if !e.1.contains(&app.gpu_index) {
-                    e.1.push(app.gpu_index);
-                }
-            }
+        if is_self(app.pid, &cmdline) {
             continue;
         }
-        if !looks_like_llm(&app.process_name, &cmdline) || is_self(app.pid, &cmdline) {
+        if is_sglang_worker(&app.process_name) || !looks_like_llm(&app.process_name, &cmdline) {
             continue;
         }
         let mut parsed = parse_cmdline(&app.process_name, &cmdline);
@@ -578,13 +635,14 @@ pub fn detect_models() -> Vec<DetectedModel> {
         if parsed.engine == "sglang" {
             parsed.port = resolve_container_host_port(app.pid, parsed.port, 30000);
         }
-        let entry = by_pid.entry(app.pid).or_insert_with(|| DetectedModel {
+        by_pid.entry(app.pid).or_insert_with(|| DetectedModel {
             name: parsed.name.clone(),
             path: parsed.path.clone(),
             pid: app.pid,
             process_name: app.process_name.clone(),
             engine: parsed.engine.clone(),
             gpu_indices: Vec::new(),
+            placement: Default::default(),
             mem_used_mb: 0,
             host: parsed.host.clone(),
             port: parsed.port,
@@ -597,10 +655,6 @@ pub fn detect_models() -> Vec<DetectedModel> {
             tensors: None,
             vision: None,
         });
-        if !entry.gpu_indices.contains(&app.gpu_index) {
-            entry.gpu_indices.push(app.gpu_index);
-        }
-        entry.mem_used_mb = entry.mem_used_mb.saturating_add(app.mem_used_mb);
     }
 
     // /proc scan for engines that might not appear in nvidia-smi
@@ -637,6 +691,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
                 process_name: name,
                 engine: parsed.engine,
                 gpu_indices: Vec::new(),
+                placement: Default::default(),
                 mem_used_mb: 0,
                 host: parsed.host,
                 port: parsed.port,
@@ -652,16 +707,8 @@ pub fn detect_models() -> Vec<DetectedModel> {
         );
     }
 
-    for (ppid, (mem, gpus)) in worker_gpu {
-        if let Some(m) = by_pid.get_mut(&ppid) {
-            m.mem_used_mb = m.mem_used_mb.saturating_add(mem);
-            for g in gpus {
-                if !m.gpu_indices.contains(&g) {
-                    m.gpu_indices.push(g);
-                }
-            }
-        }
-    }
+    fold_strata_workers(&mut by_pid, parent_pid);
+    attribute_gpu_apps(&mut by_pid, &gpu_procs, parent_pid);
 
     // Engines pinned by environment (ZE_AFFINITY_MASK on Intel, which has
     // no compute-app table) have no driver-reported placement; recover it
@@ -670,12 +717,25 @@ pub fn detect_models() -> Vec<DetectedModel> {
     // to the devices passed through.
     for m in by_pid.values_mut() {
         if m.gpu_indices.is_empty() {
-            m.gpu_indices = env_gpu_affinity(m.pid);
+            m.gpu_indices = env_gpu_affinity(m.pid, inventory);
         }
     }
 
     let mut models: Vec<DetectedModel> = by_pid.into_values().collect();
     for m in &mut models {
+        if m.engine == "strata" {
+            apply_strata_config(m);
+            if is_strata_server(&m.cmdline) {
+                if let Some((host, port)) =
+                    resolve_container_endpoint(m.pid, m.port, crate::strata::DEFAULT_PORT)
+                {
+                    m.port = Some(port);
+                    if let Some(host) = host {
+                        m.host = host;
+                    }
+                }
+            }
+        }
         if let Some(path) = m.path.clone() {
             // A containerized server reports the model path as seen from
             // its own mount namespace (e.g. /model); re-anchor it through
@@ -714,7 +774,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
     models.sort_by_key(|m| {
         let has_model = m.path.is_some() || m.gguf.is_some();
         let engine_rank = match m.engine.as_str() {
-            "llama.cpp" | "vllm" | "sglang" | "exllamav2" => 2,
+            "llama.cpp" | "vllm" | "sglang" | "strata" | "exllamav2" => 2,
             "ollama" => 0,
             _ => 1,
         };
@@ -726,6 +786,89 @@ pub fn detect_models() -> Vec<DetectedModel> {
         models.retain(|m| !m.is_idle_daemon());
     }
     models
+}
+
+/// Keep the loaded llama.cpp children as the normal dashboard entries, not a
+/// second copy of their router's aggregate VRAM. Explicit PID/endpoint choices
+/// can still select the router and use its descendant placement.
+pub fn prune_redundant_routers(models: &mut Vec<DetectedModel>, keep: &[u32]) {
+    prune_redundant_routers_with(models, keep, parent_pid);
+}
+
+fn prune_redundant_routers_with(
+    models: &mut Vec<DetectedModel>,
+    keep: &[u32],
+    parent: impl Fn(u32) -> Option<u32>,
+) {
+    let redundant: Vec<_> = models
+        .iter()
+        .filter(|router| {
+            !keep.contains(&router.pid)
+                && router.is_llama_router()
+                && router.path.is_none()
+                && router.gguf.is_none()
+                && models.iter().any(|child| {
+                    child.engine == "llama.cpp"
+                        && child.path.is_some()
+                        && server_ancestor(child.pid, |pid| pid == router.pid, &parent).is_some()
+                })
+        })
+        .map(|m| m.pid)
+        .collect();
+    models.retain(|m| !redundant.contains(&m.pid));
+}
+
+/// Prefer the server's mount namespace even if the same path exists locally.
+/// In particular, a relative --config is relative to the *server*, not us.
+fn process_file(pid: u32, path: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    if pid > 0 {
+        return if path.is_absolute() {
+            PathBuf::from(format!("/proc/{pid}/root")).join(path.strip_prefix("/").unwrap_or(path))
+        } else {
+            PathBuf::from(format!("/proc/{pid}/cwd")).join(path)
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    if path.is_relative() {
+        if let Some(cwd) = process_cwd(pid) {
+            return cwd.join(path);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn apply_strata_config(m: &mut DetectedModel) {
+    let Some(path) = crate::strata::config_path(&m.cmdline, None) else {
+        return;
+    };
+    let Some(cfg) = std::fs::read_to_string(process_file(m.pid, &path))
+        .ok()
+        .and_then(|body| crate::strata::parse_config(&body))
+    else {
+        return;
+    };
+    if let Some(name) = cfg.model_name {
+        m.name = name;
+    }
+    // The native shard has the full architecture header. A folded worker's
+    // --ple-gguf shard can describe only the embedding tensors.
+    if let Some(path) = cfg.gguf {
+        m.path = Some(process_file(m.pid, &path));
+    }
+    if m.ctx_max.is_none() {
+        m.ctx_max = cfg.max_context;
+    }
+    if crate::sglang::cmdline_flag(&m.cmdline, "--host").is_none() {
+        if let Some(host) = cfg.host {
+            m.host = connect_host(&host);
+        }
+    }
+    if crate::sglang::cmdline_flag(&m.cmdline, "--port").is_none() {
+        if let Some(port) = cfg.port {
+            m.port = Some(port);
+        }
+    }
 }
 
 /// This dashboard is itself a process with `--model` on its command line;
@@ -745,6 +888,22 @@ struct ParsedCmd {
     spec_type: Option<String>,
     n_gpu_layers: Option<u32>,
     tensor_split: Vec<f32>,
+}
+
+fn is_strata_server(cmdline: &str) -> bool {
+    let argv0 = cmdline
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .replace('\\', "/");
+    let base = argv0.rsplit('/').next().unwrap_or("");
+    // Docker clients, shells and monitoring wrappers merely mention a server
+    // in their arguments. The Python launcher is the HTTP owner.
+    (base.starts_with("python") || base == "server.py")
+        && crate::sglang::cmdline_flag(cmdline, "--engine").as_deref() == Some("strata")
+        && cmdline
+            .split_whitespace()
+            .any(|t| t == "serve.server" || t.replace('\\', "/").ends_with("serve/server.py"))
 }
 
 fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
@@ -785,7 +944,9 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
             || t.contains("sglang.launch_server")
             || t.contains("sglang.srt.entrypoints")
     };
-    keys.iter().any(|k| p.contains(k))
+    is_strata_server(cmdline)
+        || crate::strata::is_engine(process_name, cmdline)
+        || keys.iter().any(|k| p.contains(k))
         || c.split_whitespace().any(token_matches)
         || names_a_model(cmdline)
 }
@@ -862,7 +1023,9 @@ fn names_a_model(cmdline: &str) -> bool {
 
 fn engine_from(process_name: &str, cmdline: &str) -> String {
     let blob = format!("{process_name} {cmdline}").to_lowercase();
-    if blob.contains("llama-server") || blob.contains("llama.cpp") {
+    if is_strata_server(cmdline) {
+        "strata".into()
+    } else if blob.contains("llama-server") || blob.contains("llama.cpp") {
         "llama.cpp".into()
     } else if blob.contains("ollama") {
         "ollama".into()
@@ -870,6 +1033,8 @@ fn engine_from(process_name: &str, cmdline: &str) -> String {
         "vllm".into()
     } else if blob.contains("sglang") {
         "sglang".into()
+    } else if blob.contains("strata") {
+        "strata".into()
     } else if blob.contains("exllama") {
         "exllamav2".into()
     } else {
@@ -903,7 +1068,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
         };
 
         match key {
-            "--model" | "-m" | "--model-path" => {
+            // Strata's packed weights have no GGUF header; the PLE source
+            // does, and identifies the model without guessing a pack name.
+            "--model" | "-m" | "--model-path" | "--ple-gguf" => {
                 if let Some(v) = next() {
                     let p = PathBuf::from(&v);
                     parsed.name = p
@@ -1066,6 +1233,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     if parsed.tensor_split.iter().all(|&s| s == 0.0) {
         parsed.tensor_split.clear();
     }
+    if parsed.port.is_none() && is_strata_server(cmdline) {
+        parsed.port = Some(crate::strata::DEFAULT_PORT);
+    }
     if parsed.port.is_none() && parsed.engine == "llama.cpp" {
         parsed.port = Some(8080);
     }
@@ -1195,10 +1365,41 @@ fn walk_proc_llms() -> Vec<(u32, String, String)> {
 /// (`CUDA_VISIBLE_DEVICES`, or `ZE_AFFINITY_MASK` for Intel Level Zero).
 /// Empty when neither is set or /proc/<pid>/environ is unreadable (needs
 /// the same uid or root).
-fn env_gpu_affinity(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/environ"))
-        .map(|env| parse_gpu_affinity(&env))
-        .unwrap_or_default()
+fn env_gpu_affinity(pid: u32, inventory: &[GpuStats]) -> Vec<u32> {
+    let Ok(env) = std::fs::read_to_string(format!("/proc/{pid}/environ")) else {
+        return Vec::new();
+    };
+    resolve_gpu_affinity(&env, inventory)
+}
+
+fn resolve_gpu_affinity(env: &str, inventory: &[GpuStats]) -> Vec<u32> {
+    // Visibility grants access, not proof of use. In particular, a CUDA
+    // mask inherited by a Vulkan server must not claim its NVIDIA neighbor.
+    if crate::gpu::is_mixed(inventory) {
+        return Vec::new();
+    }
+    let Some(first) = inventory.first() else {
+        return Vec::new();
+    };
+    let key = match first.backend {
+        "nvml" | "smi" => "CUDA_VISIBLE_DEVICES=",
+        "xpu" => "ZE_AFFINITY_MASK=",
+        _ => return Vec::new(),
+    };
+    let mask = env
+        .split('\0')
+        .filter(|kv| kv.starts_with(key))
+        .collect::<Vec<_>>()
+        .join("\0");
+    parse_gpu_affinity(&mask)
+        .into_iter()
+        .filter_map(|local| {
+            inventory
+                .iter()
+                .find(|g| g.local_index == local)
+                .map(|g| g.index)
+        })
+        .collect()
 }
 
 /// Device indices from a NUL-separated environ block. Both variables are
@@ -1240,11 +1441,122 @@ fn cmdline_of(p: &sysinfo::Process) -> Option<String> {
     (!args.is_empty()).then(|| args.join(" "))
 }
 
+/// Strata's HTTP adapter launches the native engine as a subprocess. The
+/// child holds VRAM, the Python adapter owns the endpoint; show one server.
+fn fold_strata_workers(
+    models: &mut std::collections::HashMap<u32, DetectedModel>,
+    parent: impl Fn(u32) -> Option<u32>,
+) {
+    let workers: Vec<_> = models
+        .values()
+        .filter(|m| m.engine == "strata" && crate::strata::is_engine(&m.process_name, &m.cmdline))
+        .filter_map(|m| {
+            server_ancestor(
+                m.pid,
+                |pid| models.get(&pid).is_some_and(|m| m.engine == "strata"),
+                &parent,
+            )
+            .map(|server| (m.pid, server))
+        })
+        .collect();
+    for (worker, server) in workers {
+        let Some(worker) = models.remove(&worker) else {
+            continue;
+        };
+        let Some(server) = models.get_mut(&server) else {
+            continue;
+        };
+        server.mem_used_mb = server.mem_used_mb.saturating_add(worker.mem_used_mb);
+        for gpu in worker.gpu_indices {
+            if !server.gpu_indices.contains(&gpu) {
+                server.gpu_indices.push(gpu);
+            }
+        }
+        if worker.path.is_some() {
+            server.path = worker.path;
+            server.name = worker.name;
+        }
+    }
+}
+
+fn add_gpu_app(model: &mut DetectedModel, app: &ComputeApp) {
+    if !model.gpu_indices.contains(&app.gpu_index) {
+        model.gpu_indices.push(app.gpu_index);
+    }
+    model.mem_used_mb = model.mem_used_mb.saturating_add(app.mem_used_mb);
+}
+
+fn server_ancestor(
+    mut pid: u32,
+    is_server: impl Fn(u32) -> bool,
+    parent: impl Fn(u32) -> Option<u32>,
+) -> Option<u32> {
+    for _ in 0..32 {
+        let ppid = parent(pid)?;
+        if ppid == pid || ppid <= 1 {
+            return None;
+        }
+        if is_server(ppid) {
+            return Some(ppid);
+        }
+        pid = ppid;
+    }
+    None
+}
+
+/// A router can itself look like an LLM, as can its GPU-owning child.
+/// Attribute only observed driver records, to self and detected ancestors,
+/// never siblings or a guessed GPU. Host PIDs keep container ancestry intact.
+fn attribute_gpu_apps(
+    models: &mut std::collections::HashMap<u32, DetectedModel>,
+    apps: &[ComputeApp],
+    parent: impl Fn(u32) -> Option<u32>,
+) {
+    let mut clients = std::collections::HashMap::<(u32, u32, String), u64>::new();
+    for app in apps {
+        let mut pid = app.pid;
+        let mut visited = std::collections::HashSet::new();
+        // Bound races, corrupt trees and process exit without following cycles.
+        for _ in 0..64 {
+            if !visited.insert(pid) {
+                break;
+            }
+            if let Some(model) = models.get_mut(&pid) {
+                let mut mem_used_mb = app.mem_used_mb;
+                if !app.drm_clients.is_empty() {
+                    mem_used_mb = 0;
+                    for (id, mem_kib) in &app.drm_clients {
+                        // fork/dup can expose the same DRM client in multiple
+                        // descendants. Count its allocation once per server.
+                        let old = clients.entry((pid, app.gpu_index, id.clone())).or_default();
+                        mem_used_mb += (mem_kib / 1024).saturating_sub(*old / 1024);
+                        *old = (*old).max(*mem_kib);
+                    }
+                }
+                add_gpu_app(
+                    model,
+                    &ComputeApp {
+                        mem_used_mb,
+                        ..app.clone()
+                    },
+                );
+            }
+            let Some(ppid) = parent(pid).filter(|p| *p > 1) else {
+                break;
+            };
+            pid = ppid;
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ComputeApp {
     pid: u32,
     process_name: String,
     gpu_index: u32,
     mem_used_mb: u64,
+    /// DRM client identity and KiB allocation, for deduplication across fork.
+    drm_clients: Vec<(String, u64)>,
 }
 
 fn gpu_uuid_index_map() -> std::collections::HashMap<String, u32> {
@@ -1268,7 +1580,7 @@ fn gpu_uuid_index_map() -> std::collections::HashMap<String, u32> {
     map
 }
 
-fn nvidia_compute_apps() -> Vec<ComputeApp> {
+fn nvidia_compute_apps(inventory: &[GpuStats]) -> Vec<ComputeApp> {
     let uuid_map = gpu_uuid_index_map();
     let output = match std::process::Command::new("nvidia-smi")
         .args([
@@ -1281,8 +1593,20 @@ fn nvidia_compute_apps() -> Vec<ComputeApp> {
         _ => return Vec::new(),
     };
 
+    parse_nvidia_apps(
+        &String::from_utf8_lossy(&output.stdout),
+        &uuid_map,
+        inventory,
+    )
+}
+
+fn parse_nvidia_apps(
+    text: &str,
+    uuid_map: &std::collections::HashMap<String, u32>,
+    inventory: &[GpuStats],
+) -> Vec<ComputeApp> {
     let mut apps = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1299,12 +1623,24 @@ fn nvidia_compute_apps() -> Vec<ComputeApp> {
         let process_name = parts[2].trim().to_string();
         // Windows (WDDM) reports "[N/A]": keep the process, memory unknown.
         let mem_used = parts[3].trim().parse::<u64>().unwrap_or(0);
-        let gpu_index = uuid_map.get(uuid).copied().unwrap_or(0);
+        // An unknown UUID must not be silently assigned to GPU 0 (which
+        // could now be an AMD-only host after an NVIDIA driver failure).
+        let Some(&local_index) = uuid_map.get(uuid) else {
+            continue;
+        };
+        let Some(gpu_index) = inventory
+            .iter()
+            .find(|g| matches!(g.backend, "nvml" | "smi") && g.local_index == local_index)
+            .map(|g| g.index)
+        else {
+            continue;
+        };
         apps.push(ComputeApp {
             pid,
             process_name,
             gpu_index,
             mem_used_mb: mem_used,
+            drm_clients: Vec::new(),
         });
     }
     apps
@@ -1326,101 +1662,174 @@ fn parse_amd_fdinfo(text: &str) -> Option<AmdClient> {
     if value("drm-driver:")? != "amdgpu" {
         return None;
     }
-    let mem_used_kib = value("drm-memory-vram:")?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
+    let mem_used_kib = value("drm-memory-vram:")
+        .or_else(|| value("drm-total-vram:"))
+        .and_then(parse_drm_memory_kib)
+        .unwrap_or(0);
     Some(AmdClient {
-        pdev: value("drm-pdev:")?.to_string(),
-        client_id: value("drm-client-id:")?.to_string(),
+        pdev: value("drm-pdev:").unwrap_or_default().to_string(),
+        client_id: value("drm-client-id:").unwrap_or("unknown").to_string(),
         mem_used_kib,
     })
 }
 
+fn parse_drm_memory_kib(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let n = parts.next()?.parse::<u64>().ok()?;
+    match parts.next().unwrap_or("KiB") {
+        "KiB" | "kB" => Some(n),
+        "MiB" => n.checked_mul(1024),
+        "GiB" => n.checked_mul(1024 * 1024),
+        "B" | "bytes" => Some(n / 1024),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn amd_compute_apps() -> Vec<ComputeApp> {
+fn amd_compute_apps(inventory: &[GpuStats]) -> Vec<ComputeApp> {
+    amd_compute_apps_at(inventory, Path::new("/proc"), Path::new("/sys"))
+}
+
+#[cfg(target_os = "linux")]
+fn amd_compute_apps_at(
+    inventory: &[GpuStats],
+    proc_root: &Path,
+    sys_root: &Path,
+) -> Vec<ComputeApp> {
     use std::collections::HashMap;
 
-    let mut cards: Vec<(String, PathBuf)> = std::fs::read_dir("/sys/class/drm")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let suffix = name.to_str()?.strip_prefix("card")?.to_string();
-            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let device = entry.path().join("device");
-            let vendor = std::fs::read_to_string(device.join("vendor")).ok()?;
-            (vendor.trim() == "0x1002").then_some((suffix, device))
-        })
-        .collect();
-    cards.sort_by_key(|(card, _)| card.parse::<u32>().unwrap_or(u32::MAX));
-    let pdev_to_index: HashMap<String, u32> = cards
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (_, device))| {
-            let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
-            let pdev = uevent
-                .lines()
-                .find_map(|line| line.strip_prefix("PCI_SLOT_NAME="))?;
-            Some((pdev.to_string(), index as u32))
-        })
+    let pdev_to_index: HashMap<String, u32> = inventory
+        .iter()
+        .filter(|g| g.backend == "amd")
+        .filter_map(|g| Some((g.pci_address.clone()?, g.index)))
         .collect();
     if pdev_to_index.is_empty() {
         return Vec::new();
     }
 
     let mut clients: HashMap<(u32, u32, String), u64> = HashMap::new();
-    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+    let Ok(proc_dir) = std::fs::read_dir(proc_root) else {
         return Vec::new();
     };
     for process in proc_dir.flatten() {
         let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let Ok(fdinfo) = std::fs::read_dir(process.path().join("fdinfo")) else {
-            continue;
-        };
-        for fd in fdinfo.flatten() {
-            let Ok(text) = std::fs::read_to_string(fd.path()) else {
+        // Scan both: fdinfo may be unavailable on an older driver, but the
+        // open render node still establishes placement (memory unknown).
+        let mut fds: Vec<_> = ["fd", "fdinfo"]
+            .into_iter()
+            .flat_map(|dir| {
+                std::fs::read_dir(process.path().join(dir))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .map(|fd| fd.file_name())
+            .collect();
+        fds.sort();
+        fds.dedup();
+        for fd in fds {
+            let client = std::fs::read_to_string(process.path().join("fdinfo").join(&fd))
+                .ok()
+                .and_then(|text| parse_amd_fdinfo(&text));
+            let pdev = client
+                .as_ref()
+                .filter(|c| !c.pdev.is_empty())
+                .map(|c| c.pdev.clone())
+                .or_else(|| render_node_pci(&process.path(), &fd, sys_root));
+            let Some(gpu_index) = pdev.as_ref().and_then(|p| pdev_to_index.get(p)).copied() else {
                 continue;
             };
-            let Some(client) = parse_amd_fdinfo(&text) else {
-                continue;
-            };
-            let Some(&gpu_index) = pdev_to_index.get(&client.pdev) else {
-                continue;
-            };
+            let (id, mem) = client
+                .map(|c| (c.client_id, c.mem_used_kib))
+                .unwrap_or_else(|| ("unknown".into(), 0));
             clients
-                .entry((pid, gpu_index, client.client_id))
-                .and_modify(|mem| *mem = (*mem).max(client.mem_used_kib))
-                .or_insert(client.mem_used_kib);
+                .entry((pid, gpu_index, id))
+                .and_modify(|old| *old = (*old).max(mem))
+                .or_insert(mem);
         }
     }
 
-    let mut per_process: HashMap<(u32, u32), u64> = HashMap::new();
-    for ((pid, gpu_index, _), mem_kib) in clients {
-        *per_process.entry((pid, gpu_index)).or_default() += mem_kib;
+    let mut per_process: HashMap<(u32, u32), Vec<(String, u64)>> = HashMap::new();
+    for ((pid, gpu_index, id), mem_kib) in clients {
+        // Without a client ID we cannot deduplicate across different PIDs.
+        let id = if id == "unknown" {
+            format!("unknown-pid-{pid}")
+        } else {
+            id
+        };
+        per_process
+            .entry((pid, gpu_index))
+            .or_default()
+            .push((id, mem_kib));
     }
     per_process
         .into_iter()
-        .map(|((pid, gpu_index), mem_kib)| ComputeApp {
+        .map(|((pid, gpu_index), drm_clients)| ComputeApp {
             pid,
-            process_name: std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            process_name: std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
             gpu_index,
-            mem_used_mb: mem_kib / 1024,
+            mem_used_mb: drm_clients.iter().map(|(_, mem)| mem).sum::<u64>() / 1024,
+            drm_clients,
         })
         .collect()
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fixture_amd_attribution(
+    inventory: &[GpuStats],
+    proc_root: &Path,
+    sys_root: &Path,
+) -> Vec<(u32, u32, u64)> {
+    let mut apps: Vec<_> = amd_compute_apps_at(inventory, proc_root, sys_root)
+        .into_iter()
+        .map(|a| (a.pid, a.gpu_index, a.mem_used_mb))
+        .collect();
+    apps.sort_unstable();
+    apps
+}
+
+/// Use the device number when possible: containers can rename /dev/dri
+/// nodes. /proc/<pid>/root reanchors absolute links in their mount namespace.
+#[cfg(target_os = "linux")]
+fn render_node_pci(process: &Path, fd: &std::ffi::OsStr, sys_root: &Path) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let fd_path = process.join("fd").join(fd);
+    let target = std::fs::read_link(&fd_path).ok()?;
+    let rooted = process
+        .join("root")
+        .join(target.strip_prefix("/").unwrap_or(&target));
+    if let Ok(meta) = std::fs::metadata(&fd_path).or_else(|_| std::fs::metadata(rooted)) {
+        if meta.file_type().is_char_device() {
+            let dev = meta.rdev();
+            let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
+            let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
+            if let Some(pci) =
+                crate::gpu::pci_address(&sys_root.join(format!("dev/char/{major}:{minor}/device")))
+            {
+                return Some(pci);
+            }
+        } else {
+            return None; // a regular file named renderD128 is not a GPU
+        }
+    }
+    if target.parent() != Some(Path::new("/dev/dri")) {
+        return None;
+    }
+    let node = target.file_name()?.to_str()?;
+    let suffix = node.strip_prefix("renderD")?;
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    crate::gpu::pci_address(&sys_root.join("class/drm").join(node).join("device"))
+}
+
 #[cfg(not(target_os = "linux"))]
-fn amd_compute_apps() -> Vec<ComputeApp> {
+fn amd_compute_apps(_inventory: &[GpuStats]) -> Vec<ComputeApp> {
     Vec::new()
 }
 
@@ -1631,6 +2040,45 @@ pub fn resolve_model_path(pid: u32, path: &Path, model_name: &str) -> PathBuf {
     path.to_path_buf()
 }
 
+fn strata_model(host: &str, port: u16, m: &crate::strata::StrataMetrics) -> DetectedModel {
+    let name = crate::strata::text(&m.engine, "model")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("strata-{port}"));
+    DetectedModel {
+        name: name.clone(),
+        path: None,
+        pid: 0,
+        process_name: format!("strata (:{port})"),
+        engine: "strata".into(),
+        gpu_indices: Vec::new(),
+        placement: Default::default(),
+        mem_used_mb: 0,
+        host: host.into(),
+        port: Some(port),
+        ctx_max: m.context_max(),
+        spec_type: None,
+        n_gpu_layers: None,
+        tensor_split: Vec::new(),
+        cmdline: format!("{name} --port {port}"),
+        gguf: None,
+        tensors: None,
+        vision: None,
+    }
+}
+
+/// Explicit Strata selection only probes its read-only metrics endpoint.
+pub async fn probe_strata(
+    host: &str,
+    port: u16,
+    auth: &crate::observe::HttpAuth,
+) -> Option<DetectedModel> {
+    Some(strata_model(
+        host,
+        port,
+        &crate::strata::poll_metrics(host, port, auth).await?,
+    ))
+}
+
 /// Probe an HTTP inference server endpoint (OpenAI /v1, vLLM /metrics, llama.cpp /props, etc.).
 pub async fn probe_endpoint(
     host: &str,
@@ -1699,6 +2147,9 @@ pub async fn probe_endpoint(
     let mut vision: Option<Vision> = None;
     let mut saw_vllm_metrics = false;
     if let Ok(body) = http_get(host, port, "/metrics", auth).await {
+        if let Some(m) = crate::strata::parse_metrics(&body) {
+            return Some(strata_model(host, port, &m));
+        }
         if body.contains("vllm:") {
             saw_vllm_metrics = true;
             engine = "vllm".to_string();
@@ -1789,6 +2240,7 @@ pub async fn probe_endpoint(
         process_name: format!("{engine} (:{port})"),
         engine,
         gpu_indices,
+        placement: Default::default(),
         mem_used_mb: 0,
         host: host.to_string(),
         port: Some(port),
@@ -1805,7 +2257,18 @@ pub async fn probe_endpoint(
 
 /// Probe candidate local ports for running inference servers.
 pub async fn probe_local_endpoints(auth: &crate::observe::HttpAuth) -> Vec<DetectedModel> {
-    const CANDIDATES: &[u16] = &[7000, 8000, 8080, 11434, 30000, 5000, 8001, 8081, 7001];
+    const CANDIDATES: &[u16] = &[
+        7000,
+        8000,
+        8080,
+        11434,
+        30000,
+        5000,
+        8001,
+        8081,
+        7001,
+        crate::strata::DEFAULT_PORT,
+    ];
     // A server bound to a LAN address never accepts a loopback connection.
     // The process scan reads `--host` when it can see the command line;
     // this probe covers the case where it cannot (another user, a container
@@ -1842,6 +2305,25 @@ pub async fn probe_local_endpoints(auth: &crate::observe::HttpAuth) -> Vec<Detec
     models
 }
 
+/// Endpoint identity must not attach a remote model to unrelated local GPUs.
+/// Local LAN literals and loopback aliases can still identify the same server.
+pub fn is_local_host(host: &str) -> bool {
+    let bare = host.trim_matches(['[', ']']);
+    if bare.eq_ignore_ascii_case("localhost")
+        || matches!(bare, "0.0.0.0" | "::")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ips) = netns_ipv4s(std::process::id()) {
+        return ips.iter().any(|ip| ip == bare);
+    }
+    false
+}
+
 fn probe_hosts() -> Vec<String> {
     #[allow(unused_mut)]
     let mut hosts = vec!["127.0.0.1".to_string()];
@@ -1871,6 +2353,76 @@ fn extra_probe_ips(ips: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_masks_do_not_claim_another_vendor() {
+        let nvidia = GpuStats {
+            index: 2,
+            local_index: 2,
+            backend: "nvml",
+            ..Default::default()
+        };
+        let intel = GpuStats {
+            index: 3,
+            local_index: 3,
+            backend: "xpu",
+            ..Default::default()
+        };
+        let amd = GpuStats {
+            index: 0,
+            backend: "amd",
+            ..Default::default()
+        };
+        let env = "CUDA_VISIBLE_DEVICES=2\0ZE_AFFINITY_MASK=3.0\0";
+        assert_eq!(
+            resolve_gpu_affinity(env, std::slice::from_ref(&nvidia)),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_gpu_affinity(env, std::slice::from_ref(&intel)),
+            vec![3]
+        );
+        assert!(resolve_gpu_affinity(env, std::slice::from_ref(&amd)).is_empty());
+        assert!(resolve_gpu_affinity(env, &[nvidia, amd]).is_empty());
+        assert!(resolve_gpu_affinity(
+            env,
+            &[GpuStats {
+                mixed_host: true,
+                ..intel
+            }]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn container_proxy_keeps_lan_only_bind_and_matches_internal_port() {
+        let args = "docker-proxy -host-ip 172.16.0.73 -host-port 8098 -container-ip 172.18.0.2 -container-port 8095"
+            .split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            proxy_endpoint(&args, &["172.18.0.2".into()], 8095),
+            Some((Some("172.16.0.73".into()), 8098))
+        );
+        assert!(proxy_endpoint(&args, &["172.18.0.3".into()], 8095).is_none());
+        assert!(proxy_endpoint(&args, &["172.18.0.2".into()], 8080).is_none());
+        let mut wildcard = args.clone();
+        wildcard[2] = "0.0.0.0".into();
+        assert_eq!(
+            proxy_endpoint(&wildcard, &["172.18.0.2".into()], 8095),
+            Some((Some("127.0.0.1".into()), 8098))
+        );
+    }
+
+    #[test]
+    fn local_endpoint_identity_does_not_match_remote_hosts() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("[::1]"));
+        assert!(!is_local_host("192.0.2.42"));
+        #[cfg(target_os = "linux")]
+        for ip in netns_ipv4s(std::process::id()).unwrap_or_default() {
+            assert!(is_local_host(&ip));
+        }
+    }
 
     #[test]
     fn gpu_affinity_from_environ() {
@@ -1939,6 +2491,338 @@ mod tests {
         assert!(p.tensor_split.is_empty());
         let p = parse_cmdline("llama-server", "llama-server -m m.gguf --tensor-split 0,0");
         assert!(p.tensor_split.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mixed_host_render_nodes_memory_and_container_roots() {
+        use std::os::unix::fs::symlink;
+        let host = crate::test_support::MixedHost::new();
+        let inventory = vec![
+            GpuStats {
+                index: 0,
+                local_index: 0,
+                backend: "nvml",
+                ..Default::default()
+            },
+            GpuStats {
+                index: 1,
+                local_index: 0,
+                backend: "amd",
+                pci_address: Some("0000:43:00.0".into()),
+                ..Default::default()
+            },
+        ];
+        let fdinfo = include_str!("../fixtures/mixed-gpu/amdgpu-fdinfo.txt");
+        for (pid, node, info) in [
+            (111, "renderD129", Some(fdinfo)),
+            (112, "renderD128", None), // NVIDIA is not an AMD client
+            (113, "renderD129", None), // older driver, placement without memory
+            (114, "renderD129", Some(fdinfo)),
+            (
+                115,
+                "renderD129",
+                Some("drm-driver: amdgpu\ndrm-client-id: 42\ndrm-memory-vram: 16 MiB\n"),
+            ),
+        ] {
+            host.write(format!("proc/{pid}/comm"), "llama-server\n");
+            host.write(format!("proc/{pid}/fd/7"), "");
+            std::fs::remove_file(host.root.join(format!("proc/{pid}/fd/7"))).unwrap();
+            symlink(
+                format!("/dev/dri/{node}"),
+                host.root.join(format!("proc/{pid}/fd/7")),
+            )
+            .unwrap();
+            if let Some(info) = info {
+                host.write(format!("proc/{pid}/fdinfo/7"), info);
+            }
+        }
+        // Similar filenames do not establish DRM ownership, even when a
+        // container has a regular file under /dev/dri with that basename.
+        for pid in [118, 119] {
+            host.write(format!("proc/{pid}/comm"), "llama-server\n");
+            std::fs::create_dir_all(host.root.join(format!("proc/{pid}/fd"))).unwrap();
+            symlink(
+                if pid == 118 {
+                    "/tmp/renderD129"
+                } else {
+                    "/dev/dri/renderD9129"
+                },
+                host.root.join(format!("proc/{pid}/fd/7")),
+            )
+            .unwrap();
+        }
+        host.write(
+            "proc/119/root/dev/dri/renderD9129",
+            "not a character device",
+        );
+        host.write(
+            "sys/class/drm/renderD9129/device/uevent",
+            "PCI_SLOT_NAME=0000:43:00.0\n",
+        );
+        // dup() of the same DRM client is not a second VRAM allocation.
+        host.write("proc/114/fdinfo/8", fdinfo);
+        // A second client is added, not deduplicated against the first.
+        host.write("proc/115/fdinfo/8", fdinfo);
+        // Renamed device in a container: resolve through /proc/<pid>/root,
+        // then its device number, not the container's node basename.
+        host.write("proc/117/comm", "llama-server\n");
+        std::fs::create_dir_all(host.root.join("proc/117/root/dev")).unwrap();
+        std::fs::create_dir_all(host.root.join("proc/117/fd")).unwrap();
+        symlink(
+            "/dev/null",
+            host.root.join("proc/117/root/dev/container-amd"),
+        )
+        .unwrap();
+        symlink("/dev/container-amd", host.root.join("proc/117/fd/7")).unwrap();
+        host.write(
+            "sys/dev/char/1:3/device/uevent",
+            "PCI_SLOT_NAME=0000:43:00.0\n",
+        );
+        let mut apps =
+            amd_compute_apps_at(&inventory, &host.root.join("proc"), &host.root.join("sys"));
+        apps.sort_by_key(|a| a.pid);
+        assert_eq!(
+            apps.iter()
+                .map(|a| (a.pid, a.gpu_index, a.mem_used_mb))
+                .collect::<Vec<_>>(),
+            vec![
+                (111, 1, 14_847),
+                (113, 1, 0),
+                (114, 1, 14_847),
+                (115, 1, 14_863),
+                (117, 1, 0)
+            ]
+        );
+        // NVIDIA and AMD process records coexist, with disjoint indices.
+        let uuids = std::collections::HashMap::from([("GPU-3090".into(), 0)]);
+        let mut nvidia = parse_nvidia_apps(
+            "GPU-3090, 112, strata, 9000\nUNKNOWN, 999, ignored, 99\n",
+            &uuids,
+            &inventory,
+        );
+        assert_eq!(nvidia.len(), 1);
+        assert_eq!(nvidia[0].gpu_index, 0);
+        nvidia.extend(apps);
+        assert_eq!(nvidia.len(), 6);
+        // AMD-only uses local ordinal 0, never an NVIDIA offset guessed anew.
+        let mut amd_only = inventory[1].clone();
+        amd_only.index = 0;
+        let apps =
+            amd_compute_apps_at(&[amd_only], &host.root.join("proc"), &host.root.join("sys"));
+        assert!(apps.iter().all(|a| a.gpu_index == 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn router_fixture() -> std::collections::HashMap<u32, DetectedModel> {
+        use std::os::unix::fs::symlink;
+        let host = crate::test_support::MixedHost::new();
+        let processes: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/mixed-gpu/router-process-tree.json"
+        ))
+        .unwrap();
+        let mut models = std::collections::HashMap::new();
+        for process in processes.as_array().unwrap() {
+            let pid = process["pid"].as_u64().unwrap() as u32;
+            let ppid = process["ppid"].as_u64().unwrap() as u32;
+            let name = process["comm"].as_str().unwrap();
+            let cmd = process["cmdline"].as_str().unwrap();
+            host.write(
+                format!("proc/{pid}/stat"),
+                format!("{pid} ({name}) S {ppid} 0 0\n"),
+            );
+            host.write(format!("proc/{pid}/comm"), name);
+            if looks_like_llm(name, cmd) {
+                let mut model = crate::demo::demo_models(8192, 1).remove(0);
+                let parsed = parse_cmdline(name, cmd);
+                model.pid = pid;
+                model.engine = parsed.engine;
+                model.path = parsed.path;
+                model.gguf = None;
+                model.cmdline = cmd.into();
+                model.gpu_indices.clear();
+                model.mem_used_mb = 0;
+                models.insert(pid, model);
+            }
+            if let Some(target) = process["fd"].as_str() {
+                std::fs::create_dir_all(host.root.join(format!("proc/{pid}/fd"))).unwrap();
+                symlink(target, host.root.join(format!("proc/{pid}/fd/3"))).unwrap();
+                if let Some(info) = process["fdinfo"].as_str() {
+                    host.write(format!("proc/{pid}/fdinfo/3"), info);
+                    host.write(format!("proc/{pid}/fdinfo/4"), info); // dup, not more VRAM
+                }
+                if process["container"].as_bool() == Some(true) {
+                    std::fs::create_dir_all(host.root.join(format!("proc/{pid}/root/dev")))
+                        .unwrap();
+                    symlink(
+                        "/dev/null",
+                        host.root.join(format!("proc/{pid}/root/dev/container-amd")),
+                    )
+                    .unwrap();
+                    // Fixture character device's number stands in for passed-through DRM.
+                    host.write(
+                        "sys/dev/char/1:3/device/uevent",
+                        "PCI_SLOT_NAME=0000:43:00.0\n",
+                    );
+                }
+            }
+        }
+        let inventory = vec![GpuStats {
+            index: 1,
+            backend: "amd",
+            pci_address: Some("0000:43:00.0".into()),
+            ..Default::default()
+        }];
+        let apps = amd_compute_apps_at(&inventory, &host.root.join("proc"), &host.root.join("sys"));
+        attribute_gpu_apps(&mut models, &apps, |pid| {
+            let stat = std::fs::read_to_string(host.root.join(format!("proc/{pid}/stat"))).ok()?;
+            ppid_from_stat(&stat)
+        });
+        models
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn router_inherits_recognized_child_gpu_while_idle() {
+        let models = router_fixture();
+        assert_eq!(models[&1721].gpu_indices, vec![1]);
+        assert_eq!(models[&1688].gpu_indices, vec![1]);
+        assert_eq!(models[&1688].mem_used_mb, 22_201);
+        assert_eq!(models[&1721].mem_used_mb, 22_201);
+        assert!(models[&2000].gpu_indices.is_empty()); // unrelated server, no GPU FD
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn router_inherits_container_child_render_node_without_fdinfo() {
+        let models = router_fixture();
+        assert_eq!(models[&3026].gpu_indices, vec![1]);
+        assert_eq!(models[&3000].gpu_indices, vec![1]);
+        assert_eq!(models[&3000].mem_used_mb, 0); // placement, not invented VRAM
+        assert!(models[&2000].gpu_indices.is_empty());
+    }
+
+    #[test]
+    fn restricted_proc_router_remains_a_public_port_mapping_target() {
+        let mut model = crate::demo::demo_models(8192, 1).remove(0);
+        model.engine = "llama.cpp".into();
+        model.cmdline = "llama-server --models-preset /config/models.ini --port 8080".into();
+        model.path = None;
+        model.gguf = None;
+        model.gpu_indices.clear();
+        model.mem_used_mb = 0;
+        assert!(!model.is_idle_daemon());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn redundant_router_is_hidden_unless_explicitly_requested() {
+        let parent = |pid| match pid {
+            1721 => Some(1688),
+            3026 => Some(3000),
+            _ => None,
+        };
+        let mut models: Vec<_> = router_fixture().into_values().collect();
+        prune_redundant_routers_with(&mut models, &[1688], parent);
+        assert!(models.iter().any(|m| m.pid == 1688));
+        assert!(!models.iter().any(|m| m.pid == 3000));
+        assert!(models.iter().any(|m| m.pid == 2000)); // not a router
+        prune_redundant_routers_with(&mut models, &[], parent);
+        assert!(!models.iter().any(|m| m.pid == 1688));
+        assert!(models.iter().any(|m| m.pid == 1721));
+    }
+
+    #[test]
+    fn descendant_clients_deduplicate_across_fork_and_bound_cycles() {
+        let mut model = crate::demo::demo_models(8192, 1).remove(0);
+        model.pid = 100;
+        model.gpu_indices.clear();
+        model.mem_used_mb = 0;
+        let mut models = std::collections::HashMap::from([(100, model)]);
+        let apps = [200, 300].map(|pid| ComputeApp {
+            pid,
+            process_name: "worker".into(),
+            gpu_index: 1,
+            mem_used_mb: 16,
+            drm_clients: vec![("shared-client".into(), 16 * 1024)],
+        });
+        let parent = |pid| match pid {
+            200 | 300 => Some(100),
+            100 => Some(200),
+            _ => None,
+        };
+        attribute_gpu_apps(&mut models, &apps, parent);
+        assert_eq!(models[&100].gpu_indices, vec![1]);
+        assert_eq!(models[&100].mem_used_mb, 16); // not 32, even with a cycle
+        attribute_gpu_apps(&mut models, &[], parent); // unreadable driver records are not guesses
+        assert_eq!(models[&100].mem_used_mb, 16);
+    }
+
+    #[test]
+    fn strata_gpu_process_is_a_server_not_an_unidentified_worker() {
+        let cmd = "/opt/strata/build/strata --serve --pack /pack --native --ple-gguf /models/Qwen-Flash-Next.gguf";
+        assert!(looks_like_llm("strata", cmd));
+        let parsed = parse_cmdline("strata", cmd);
+        assert_eq!(parsed.engine, "strata");
+        assert_eq!(parsed.name, "Qwen-Flash-Next");
+        assert_eq!(
+            parsed.path,
+            Some(PathBuf::from("/models/Qwen-Flash-Next.gguf"))
+        );
+        assert_eq!(parsed.port, None); // not a guessed llama.cpp API
+    }
+
+    #[test]
+    fn strata_native_worker_folds_onto_the_http_adapter() {
+        let mut server = crate::demo::demo_models(8192, 1).remove(0);
+        server.pid = 100;
+        server.engine = "strata".into();
+        server.process_name = "python".into();
+        server.gpu_indices.clear();
+        server.mem_used_mb = 0;
+        let mut worker = server.clone();
+        worker.pid = 200;
+        worker.process_name = "/opt/strata/build/strata".into();
+        worker.cmdline = "/opt/strata/build/strata --serve --native /models/flash-next.gguf".into();
+        worker.name = "Flash-Next".into();
+        worker.path = Some("/models/flash-next.gguf".into());
+        worker.gpu_indices = vec![0];
+        worker.mem_used_mb = 23_412;
+        let mut models = std::collections::HashMap::from([(100, server), (200, worker)]);
+        fold_strata_workers(&mut models, |pid| (pid == 200).then_some(100));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[&100].name, "Flash-Next");
+        assert_eq!(models[&100].gpu_indices, vec![0]);
+        assert_eq!(models[&100].mem_used_mb, 23_412);
+    }
+
+    #[test]
+    fn worker_placement_folds_to_host_visible_server() {
+        let parent = |pid| match pid {
+            300 => Some(200),
+            200 => Some(100),
+            _ => None,
+        };
+        assert_eq!(server_ancestor(300, |pid| pid == 100, parent), Some(100));
+        assert_eq!(server_ancestor(300, |pid| pid == 999, parent), None);
+        assert_eq!(server_ancestor(300, |_| false, Some), None);
+        let mut model = crate::demo::demo_models(8192, 1).remove(0);
+        model.gpu_indices.clear();
+        model.mem_used_mb = 0;
+        for (index, mb) in [(0, 9_000), (1, 16_000), (1, 1_000)] {
+            add_gpu_app(
+                &mut model,
+                &ComputeApp {
+                    pid: 300,
+                    process_name: "worker".into(),
+                    gpu_index: index,
+                    mem_used_mb: mb,
+                    drm_clients: Vec::new(),
+                },
+            );
+        }
+        assert_eq!(model.gpu_indices, vec![0, 1]);
+        assert_eq!(model.mem_used_mb, 26_000);
     }
 
     #[test]
@@ -2088,25 +2972,35 @@ mod tests {
     #[test]
     #[ignore = "live check: run on a host with real servers, e.g. docker run --pid:host"]
     fn detects_live_servers() {
-        let models = detect_models();
+        let inventory = crate::gpu::GpuBackend::detect(crate::nvml::NvmlSession::new()).inventory();
+        let mut models = detect_models(&inventory);
         for m in &models {
             eprintln!(
-                "detected: pid={} comm={} engine={} name={:?} port={:?} layers={} heads={} experts={}/{} path={:?} cmdline={}",
-                m.pid, m.process_name, m.engine, m.name, m.port,
-                m.n_layers(), m.n_heads(), m.n_experts_used(), m.n_experts(),
-                m.path.as_ref().map(|p| p.display().to_string()),
-                m.cmdline.chars().take(120).collect::<String>()
+                "detected: {m} port={:?} layers={} heads={} experts={}/{}",
+                m.port,
+                m.n_layers(),
+                m.n_heads(),
+                m.n_experts_used(),
+                m.n_experts()
             );
         }
         assert!(
             !models.is_empty(),
             "no inference servers detected on this host"
         );
+        // Check the actual default dashboard entries, not a router's aggregate
+        // placement entry, which has no model topology of its own.
+        prune_redundant_routers(&mut models, &[]);
         // Topology must not fall back to the "1 layer" clamp when the
         // served model is a safetensors dir: either GGUF or HF config
         // metadata has to provide real numbers.
         assert!(
-            models.iter().all(|m| m.n_layers() > 1),
+            // A Strata PLE-only shard need not contain the full model's
+            // topology. Do not invent one from its packed weight bytes.
+            models
+                .iter()
+                .filter(|m| m.engine != "strata")
+                .all(|m| m.n_layers() > 1),
             "layer count fell back to 1 — topology metadata missing"
         );
     }
@@ -2233,6 +3127,94 @@ mod tests {
     }
 
     #[test]
+    fn strata_engine_memory_folds_across_cards() {
+        let mut server = crate::demo::demo_models(8192, 1).remove(0);
+        server.pid = 42;
+        server.engine = "strata".into();
+        server.gpu_indices.clear();
+        server.mem_used_mb = 0;
+        let mut models = std::collections::HashMap::from([(42, server)]);
+        let apps: Vec<_> = [(0, 1000), (1, 2000)]
+            .into_iter()
+            .map(|(gpu_index, mem_used_mb)| ComputeApp {
+                pid: 43,
+                process_name: "strata".into(),
+                gpu_index,
+                mem_used_mb,
+                drm_clients: vec![],
+            })
+            .collect();
+        attribute_gpu_apps(&mut models, &apps, |pid| (pid == 43).then_some(42));
+        assert_eq!(models[&42].mem_used_mb, 3000);
+        assert_eq!(models[&42].gpu_indices, vec![0, 1]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strata_config_uses_process_mount_namespace_and_cwd() {
+        let pid = std::process::id();
+        let path = Path::new("fixtures/strata-config.json");
+        assert_eq!(
+            process_file(pid, path),
+            PathBuf::from(format!("/proc/{pid}/cwd/fixtures/strata-config.json"))
+        );
+        let absolute = std::env::current_dir().unwrap().join(path);
+        assert!(process_file(pid, &absolute).starts_with(format!("/proc/{pid}/root")));
+        let snapshot =
+            crate::strata::parse_metrics(include_str!("../fixtures/strata-idle.json")).unwrap();
+        let mut m = strata_model("127.0.0.1", 8095, &snapshot);
+        m.pid = pid;
+        m.ctx_max = None;
+        m.cmdline =
+            "python serve/server.py --engine strata --config fixtures/strata-config.json".into();
+        apply_strata_config(&mut m);
+        assert_eq!(m.name, "synthetic-config-model");
+        assert_eq!(m.ctx_max, Some(32768));
+        assert_eq!(m.host, "172.16.0.73");
+        assert_eq!(m.port, Some(8098));
+        assert_eq!(
+            m.path,
+            Some(process_file(pid, Path::new("fixtures/synthetic.gguf")))
+        );
+        m.ctx_max = Some(8192); // explicit CLI context wins
+        m.cmdline.push_str(" --host 127.0.0.1 --port 8096");
+        m.host = "127.0.0.1".into();
+        m.port = Some(8096);
+        apply_strata_config(&mut m);
+        assert_eq!(m.ctx_max, Some(8192));
+        assert_eq!(m.host, "127.0.0.1");
+        assert_eq!(m.port, Some(8096));
+    }
+
+    #[test]
+    fn detects_only_strata_http_launcher() {
+        let cmd = "python serve/server.py --engine strata --config strata-model.json --port 8098";
+        assert!(looks_like_llm("python", cmd));
+        let p = parse_cmdline("python", cmd);
+        assert_eq!(p.engine, "strata");
+        assert_eq!(p.port, Some(8098));
+        assert_eq!(
+            parse_cmdline("python", "python -m serve.server --engine=strata").port,
+            Some(crate::strata::DEFAULT_PORT)
+        );
+        assert!(is_strata_server(
+            r"python C:\Strata\serve\server.py --engine strata"
+        ));
+        assert!(!is_strata_server("python setup.py --engine strata"));
+        assert!(!is_strata_server(
+            "docker run strata python serve/server.py --engine strata"
+        ));
+        assert!(!is_strata_server(
+            "bash -c python serve/server.py --engine strata"
+        ));
+        assert!(!looks_like_llm("strata", "strata --context 262144"));
+        assert!(!looks_like_llm("bash", "bash check-strata.sh"));
+        let snapshot =
+            crate::strata::parse_metrics(include_str!("../fixtures/strata-idle.json")).unwrap();
+        assert!(!strata_model("127.0.0.1", 8080, &snapshot).is_idle_daemon());
+    }
+
+    #[test]
     fn parse_endpoint_urls() {
         assert_eq!(
             parse_endpoint("http://localhost:7000/v1"),
@@ -2284,6 +3266,7 @@ mod tests {
             process_name: "vllm (:7000)".into(),
             engine: "vllm".into(),
             gpu_indices: vec![],
+            placement: Default::default(),
             mem_used_mb: 0,
             host: "127.0.0.1".into(),
             port: Some(7000),

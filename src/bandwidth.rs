@@ -47,15 +47,9 @@ pub fn weight_layout(detected: Option<&DetectedModel>, gpus: &[GpuStats]) -> Wei
     let cpu_bytes = if m.n_gpu_layers == Some(0) || gpus.is_empty() {
         total
     } else {
-        let split_sum: f32 = m.tensor_split.iter().copied().sum::<f32>().max(1.0);
         let mut on_gpu = 0u64;
         for g in gpus {
-            let i = g.index as usize;
-            let share = if m.tensor_split.is_empty() {
-                1.0 / gpus.len().max(1) as f32
-            } else {
-                m.tensor_split.get(i).copied().unwrap_or(0.0) / split_sum
-            };
+            let share = m.gpu_share(g.index, gpus);
             let want = (total as f64 * share as f64) as u64;
             on_gpu += want.min(g.mem_used_mb * 1024 * 1024);
         }
@@ -361,6 +355,6 @@ mod tests {
         let on_gpu = (7_800u64 + 11_800) * 1024 * 1024;
         assert_eq!(l.cpu_bytes, 25_000_000_000 - on_gpu);
         assert_eq!(l.active_bytes, 24_000_000_000);
-        assert_eq!(weight_layout(None, &gpus).known, false);
+        assert!(!weight_layout(None, &gpus).known);
     }
 }

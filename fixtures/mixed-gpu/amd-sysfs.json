@@ -1,0 +1,16 @@
+{
+  "class/drm/card0/device/vendor": "0x10de\n",
+  "class/drm/card2/device/vendor": "0x1002\n",
+  "class/drm/card2/device/device": "0x744c\n",
+  "class/drm/card2/device/uevent": "PCI_SLOT_NAME=0000:43:00.0\n",
+  "class/drm/card2/device/gpu_busy_percent": "72\n",
+  "class/drm/card2/device/mem_busy_percent": "41\n",
+  "class/drm/card2/device/mem_info_vram_total": "25769803776\n",
+  "class/drm/card2/device/mem_info_vram_used": "17179869184\n",
+  "class/drm/card2/device/hwmon/hwmon0/name": "amdgpu\n",
+  "class/drm/card2/device/hwmon/hwmon0/temp1_input": "55000\n",
+  "class/drm/card2/device/hwmon/hwmon0/power1_average": "185000000\n",
+  "class/drm/card2/device/hwmon/hwmon0/power1_cap": "294000000\n",
+  "class/drm/renderD129/device/uevent": "PCI_SLOT_NAME=0000:43:00.0\n",
+  "class/drm/renderD128/device/uevent": "PCI_SLOT_NAME=0000:01:00.0\n"
+}

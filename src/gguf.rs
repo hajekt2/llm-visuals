@@ -273,7 +273,7 @@ fn read_tensor_summary_one(path: &Path) -> Result<TensorSummary, String> {
         tensors.push((name, offset));
     }
     let header_end = f.stream_position().map_err(|e| e.to_string())?;
-    let data_start = (header_end + alignment - 1) / alignment * alignment;
+    let data_start = header_end.div_ceil(alignment) * alignment;
     let data_len = file_len.saturating_sub(data_start);
     tensors.sort_by_key(|(_, off)| *off);
     let mut out = TensorSummary {
@@ -439,6 +439,9 @@ pub fn layer_device(layer: usize, n_layers: usize, split: &[f32], gpu_indices: &
     if n_layers == 0 {
         return 0;
     }
+    if gpu_indices.len() == 1 {
+        return gpu_indices[0] as usize;
+    }
     if split.is_empty() {
         if gpu_indices.is_empty() {
             return 0;
@@ -448,16 +451,33 @@ pub fn layer_device(layer: usize, n_layers: usize, split: &[f32], gpu_indices: &
         let idx = layer * gpu_indices.len() / n_layers;
         return gpu_indices[idx.min(gpu_indices.len() - 1)] as usize;
     }
+    // Device ordinals in --tensor-split are not dashboard indices. Zero
+    // entries can describe devices the server never opened.
+    let active: Vec<f32> = split.iter().copied().filter(|s| *s > 0.0).collect();
+    let split = if !gpu_indices.is_empty() && active.len() == gpu_indices.len() {
+        &active
+    } else {
+        split
+    };
     let total: f32 = split.iter().copied().sum::<f32>().max(1.0);
     let t = (layer as f32 + 0.5) / n_layers as f32 * total;
     let mut acc = 0.0;
     for (i, s) in split.iter().enumerate() {
         acc += *s;
         if t <= acc {
-            return i;
+            return gpu_indices
+                .get(i)
+                .or_else(|| gpu_indices.last())
+                .copied()
+                .map(|g| g as usize)
+                .unwrap_or(i);
         }
     }
-    split.len() - 1
+    gpu_indices
+        .last()
+        .copied()
+        .map(|g| g as usize)
+        .unwrap_or(split.len() - 1)
 }
 
 #[allow(dead_code)]
@@ -476,6 +496,15 @@ mod tests {
         assert_eq!(layer_device(0, 41, &split, &[]), 0);
         assert_eq!(layer_device(25, 41, &split, &[]), 0);
         assert_eq!(layer_device(40, 41, &split, &[]), 1);
+    }
+
+    #[test]
+    fn tensor_split_never_escapes_observed_global_indices() {
+        for layer in 0..64 {
+            assert!([4, 5].contains(&layer_device(layer, 64, &[1.0, 1.0, 1.0], &[4, 5])));
+        }
+        assert_eq!(layer_device(0, 64, &[1.0], &[1]), 1);
+        assert_eq!(layer_device(63, 64, &[0.0, 1.0], &[1]), 1);
     }
 
     #[test]
@@ -576,7 +605,11 @@ mod tests {
                 ("tokenizer.chat_template", 8, gguf_str("{{ messages }}")),
                 ("deepseek4.block_count", 4, 43u32.to_le_bytes().to_vec()),
                 ("deepseek4.expert_count", 4, 256u32.to_le_bytes().to_vec()),
-                ("deepseek4.expert_used_count", 4, 6u32.to_le_bytes().to_vec()),
+                (
+                    "deepseek4.expert_used_count",
+                    4,
+                    6u32.to_le_bytes().to_vec(),
+                ),
             ],
         );
         let info = read_info(&path).expect("gguf header");

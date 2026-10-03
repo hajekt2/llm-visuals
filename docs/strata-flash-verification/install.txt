@@ -1,0 +1,7 @@
+llm-visuals-0.10.0-hajek.3-linux-x86_64.tar.gz: OK
+llm-visuals 0.10.0-hajek.3
+llm-visuals 0.10.0-hajek.2
+785cb9c35cf1c191eb46ff10a6678173c6a6102198a61df4b7d295017b225da4  /usr/local/bin/llm-visuals
+1c8cc7ac662b41d622563d21c7bacd40b2f6e00032d22505ead7a7660f32a977  /usr/local/bin/llm-visuals.hajek2
+-rwxr-xr-x 1 root root 5130296 Oct  3 13:13 /usr/local/bin/llm-visuals
+-rwxr-xr-x 1 root root 5007576 Oct  3 13:13 /usr/local/bin/llm-visuals.hajek2

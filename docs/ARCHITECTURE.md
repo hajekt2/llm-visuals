@@ -64,6 +64,7 @@ GPUs and the disk are shared.
 | `observe.rs` | HTTP GET with timeouts; parsers for `/slots`, `/metrics` (Prometheus text) and `/experts` |
 | `vllm.rs` | vLLM `/metrics` adapter: reconstructs per-request `LiveStats` from engine-wide Prometheus counters |
 | `sglang.rs` | SGLang adapter: `GET /v1/loads?include=all` plus one-shot `/server_info`; optional `sglang:realtime_tokens_total` |
+| `strata.rs` | Strata JSON `/metrics`: optional fields, live state/context, server-windowed rates, remote hardware/settings and recent request summaries |
 | `gpu.rs` | in-process NVML telemetry collector (falling back to `nvidia-smi` CSV) or Linux amdgpu sysfs on a `spawn_blocking` thread; smooth random-walk demo GPUs |
 | `nvml.rs` | dynamically loads `nvml.dll` or `libnvidia-ml.so`; maintains a persistent in-process session for GPU metrics and PCIe throughput without subprocess overhead |
 | `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers; `Meter` (VU channel with peak hold and auto scale) and `BandwidthStats` for the pipeline view |
@@ -106,6 +107,26 @@ fetched once for `context_length` and `speculative_algorithm`. Speculative
 acceptance is `generated − steps`, drafted tokens are
 `steps × (num_draft_tokens − 1)`. The SGLang poller never runs faster than
 400 ms (each GET is a uvicorn access-log line).
+
+**Strata `/metrics`** is JSON, not Prometheus. Detection recognises its
+`engine`/`live` shape; `--backend strata --endpoint URL` selects it explicitly.
+The poller sends a `LiveStats` with its optional `StrataMetrics` snapshot.
+`PerfTracker` uses `live.tok_s` and `prefill_tok_s_mean` directly instead of
+prefill progress deltas (which include reused tokens). Context matches Strata's
+Monitor: live prompt + generated tokens, else the last request when idle.
+Server-lifetime totals are taken from `totals`; request rows are rendered from
+`requests`, not fabricated from polling boundaries or imported into SQLite.
+Failed or hung scrapes retain the last good snapshot with a stale age. They
+are excluded from rate/acceptance histories; the same poller retries with
+backoff. Requests use the existing 500/1500 ms connection/read timeouts.
+The remote Strata layout renders hardware from the server snapshot. Local
+processes keep the mixed-GPU driver panels and their placement provenance,
+without estimating Strata's weight/KV split. Native GGUF metadata comes from
+`--config` through the launcher's mount namespace; it supplies architecture
+counts, not per-layer placement or routing. Optional 0.1.38 draft counters
+provide completed-request and server-total acceptance. Unsupported TTFT,
+verification steps and parked occupancy stay unknown. See the README's
+Strata field table.
 
 **HuggingFace `config.json`** (safetensors dirs, including nested
 `text_config`) fills the same architecture fields as a GGUF header, so the
