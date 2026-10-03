@@ -65,9 +65,56 @@ successful request rates. Live busy rates were not revalidated in this service
 state; parser/performance tests cover them. No service restart, model reload,
 configuration change or inference traffic was performed by this worker.
 
-## Release/deployment status
+## Published release and installation receipt
 
-Prepared release name: `v0.10.0-hajek.3`. Publication, independent asset download
-verification and installation are pending. The intended destination is the
-`hajekt2/llm-visuals` fork only, as a prerelease, not latest stable. Installation
-will preserve `/usr/local/bin/llm-visuals.hajek2` before replacing the executable.
+Published and independently download-verified on 2026-10-03:
+
+- Release: https://github.com/hajekt2/llm-visuals/releases/tag/v0.10.0-hajek.3
+- State: published (`draft: false`), prerelease (`prerelease: true`), created
+  with `--latest=false`. Only the hajekt2 fork was modified.
+- Tag/source: `e0becbd4067fa8b8aa967c32fe8d97bd23b66338` on
+  `fm/llm-visuals-strata-flash`. This documentation receipt advances the branch
+  without moving the release tag.
+- Archive: `llm-visuals-0.10.0-hajek.3-linux-x86_64.tar.gz`, 2,436,285 bytes,
+  containing exactly the root-level executable `llm-visuals`.
+- Archive SHA-256:
+  `3b43f1fbb2875cd8a30429b753bfa0d78129b1b8ee1267306faf1524b6e51e0f`.
+- Executable SHA-256:
+  `785cb9c35cf1c191eb46ff10a6678173c6a6102198a61df4b7d295017b225da4`.
+
+Asset URL:
+https://github.com/hajekt2/llm-visuals/releases/download/v0.10.0-hajek.3/llm-visuals-0.10.0-hajek.3-linux-x86_64.tar.gz
+
+Sidecar: same URL plus `.sha256`. Tar ownership is root, mtime is source commit
+Unix time `1791025944`, and gzip omits source filename/timestamp. Build host is
+Ubuntu 24.04/glibc 2.39; older glibc and non-x86_64 platforms are unverified for
+this artifact.
+
+Downloaded assets with `gh-axi release download`, checked the sidecar, inspected
+the archive, and compared the extracted executable byte-for-byte with the
+live-verified build. GitHub's asset digest matches the archive hash. The remote
+installation checked that same downloaded archive, preserved the original
+binary, and atomically replaced `/usr/local/bin/llm-visuals` as root mode 0755.
+
+- Installed version: `llm-visuals 0.10.0-hajek.3`; hash matches the release binary.
+- Backup: `/usr/local/bin/llm-visuals.hajek2`, still `0.10.0-hajek.2`, SHA-256
+  `1c8cc7ac662b41d622563d21c7bacd40b2f6e00032d22505ead7a7660f32a977`.
+- [Installation output](strata-flash-verification/install.txt).
+- [Installed Flash-Next screenshot](strata-flash-verification/installed-flash.svg)
+  and [text](strata-flash-verification/installed-flash.txt).
+- [Installed Qwen 27B screenshot](strata-flash-verification/installed-27b.svg)
+  and [text](strata-flash-verification/installed-27b.txt).
+- [Full installed capture](strata-flash-verification/installed-user.txt), including
+  model switching, comparison, layer/perf zooms and 100x30.
+- [hajek.2 baseline](strata-flash-verification/hajek2-user.txt). Qwen 27B retains
+  its 75,821 / 190,208 context, 65 layers and existing restricted-procfs
+  placement status in the ordinary-user capture. Both GPU cards remain visible.
+
+No service or homelab-IaC configuration was changed. The current IaC pin remains
+hajek.2, so a later reconciliation could restore it. The new desired pin is:
+
+```yaml
+ai_inference_llm_visuals_version: '0.10.0-hajek.3'
+ai_inference_llm_visuals_sha256: 3b43f1fbb2875cd8a30429b753bfa0d78129b1b8ee1267306faf1524b6e51e0f
+ai_inference_llm_visuals_release_base_url: https://github.com/hajekt2/llm-visuals/releases/download
+```

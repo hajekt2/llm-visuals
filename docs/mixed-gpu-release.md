@@ -1,9 +1,9 @@
 # Fork release receipts
 
-## v0.10.0-hajek.2: current release
+## v0.10.0-hajek.2: previous release
 
-Prepared on 2026-10-02; publication and independent download verification are
-pending. Firstmate steering `001.msg` authorized publishing this follow-up to
+Published on 2026-10-02. The installed binary was backed up during the
+[hajek.3 Strata integration](strata-flash-release.md); its hash matches below. Firstmate steering `001.msg` authorized publishing this follow-up to
 the owner's fork after ordinary-user live validation. No upstream contact or
 publication, homelab deployment, service restart or configuration change is
 part of this worker's release.
