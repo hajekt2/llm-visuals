@@ -527,35 +527,48 @@ file is required. For a server on another machine:
 
 ```sh
 cargo install --path . --locked
-llm-visuals --endpoint http://inference-host:8080 --backend strata
+llm-visuals --endpoint http://inference-host:8098 --backend strata --log-db off
 ```
 
 `--endpoint` alone also auto-detects Strata from the JSON metrics shape.
-`--model http://inference-host:8080/v1` works too. Local
+`--model http://inference-host:8098/v1` works too. Local
 `python serve/server.py --engine strata` launchers are detected by process
-scan, including their `--host` and `--port`. A remote server must be selected
-by URL; the dashboard does not scan your network.
+scan, including their `--host`, `--port` and `--config`. The HTTP launcher's
+default port is 8095; inference03 explicitly uses 8098. Its native child is
+folded into the launcher for GPU attribution, not polled as another server.
+A remote server must be selected by URL; the dashboard does not scan your network.
 
 The Strata view shows server-windowed decode and engine-measured mean prefill
 rates (with local display smoothing and history), model/context fill, prompt
-progress, state/phase and queued requests. Its hardware panel uses the
+progress, state/phase and queued requests. For a remote endpoint, its hardware panel uses the
 **server's** GPU, PCIe, CPU, RAM and disk readings, never the monitoring
-machine's telemetry. It also shows KV mode/residency, expert-cache capacity
+machine's telemetry. A local process uses the mixed-GPU driver panels, with
+existing direct/inferred/configured placement labels. Its VRAM weight/KV split
+stays unknown because Strata offloads experts dynamically. It also shows KV mode/residency, expert-cache capacity
 and slots, free VRAM, speculative/MTP/lookup settings, conversation-cache
 capacity, prefix reuse and expert-cache hits from recent requests. Wider
 terminals include engine allocation settings and request RAM/file blob counts.
 Recent requests come directly from Strata, newest first, with measured prompt
 and decode rates/times and finish reasons.
 
-**Unavailable is not zero.** The verified `/metrics` contract does not expose
-TTFT, draft offered/accepted counters, current prefix reuse, or the number of
-parked conversations. These are explicitly marked unavailable; `prompt_ms`
-is shown as **prompt time**, not TTFT, and configured conversation-cache slots
-are **capacity**, not occupancy. Expert `hit_rate` is not speculative
-acceptance or prompt-cache hit rate. No layer placement, expert identities,
-weight/KV memory split or bandwidth bottleneck is invented. While Strata has
-focus, the zoom/view keys retain these Strata panels rather than showing
-unsupported layer/expert simulations.
+Verified against Strata **0.1.38**, with older 0.1.31 fixtures retained.
+Draft acceptance uses optional `drafts_accepted / drafts_offered` counters
+from completed requests and server totals. These are not live verification
+steps. Older versions without these fields show acceptance as unavailable.
+
+**Unavailable is not zero.** TTFT, live prefix reuse, verification-step counts
+and parked-conversation occupancy are not exported. `prompt_ms` is **prompt
+time**, not TTFT; configured conversation-cache slots are **capacity**, not
+occupancy. Expert `hit_rate` is not speculative acceptance or prompt-cache hit
+rate. Context explicitly describes the live request or the last completed
+request when idle/unloaded, not all resident conversations.
+
+The layer/expert zoom keys show architecture counts from a readable native
+GGUF header, found through the launcher's `--config` in its mount namespace.
+Published container ports retain their bind address, including LAN-only
+Docker proxies. Process placement identifies the serving GPU; per-layer placement and expert
+routing remain **not reported**. No activity tiles, memory split or bottleneck
+are invented. The model comparison key still compares both backends.
 
 | Strata display | JSON fields from `/metrics` |
 |---|---|
@@ -565,18 +578,23 @@ unsupported layer/expert simulations.
 | KV, experts, VRAM | `engine.kv`, `kv_resident`, `expert_cache_mib`, `expert_slots`, `expert_cache_primary_mib`, `expert_slots_primary`, `vram_free_mib` |
 | Spec/cache settings | `engine.spec`, `mtp_max`, `lookup`, `conversation_cache_mib`, `conversation_cache_slots`, `conversation_cache_min_free_mib`; allocation/settings line uses `arena_mib`, `pool_workers`, `pcie_frac`, `spec_min_p`, `cvec`, `version`, `images` |
 | Hardware | `hardware.gpu_*`, `cpu`, `ram_used`, `ram_total`, `disk_read_mb`, `disk_write_mb`; names/counts from `hardware_static`. Byte sizes are converted to GiB; PCIe/disk rates are MiB/s. Multi-GPU telemetry follows Strata's aggregation |
+| Draft acceptance | `requests[].drafts_offered`, `drafts_accepted`; `totals.drafts_offered`, `drafts_accepted`. Null/missing/invalid counts and zero denominators stay unknown |
 | Request history | `requests[].finish`, `prompt_tokens`, `reused`, `output_tokens`, `prompt_ms`, `decode_tok_s`, `duration_s`, `hit_rate`, `file_mb`, `ram_blobs`, `file_blobs`; prefill = `(prompt_tokens − reused) / (prompt_ms / 1000)` |
 | Server totals, tok/J | `totals.requests`, `prompt_tokens`, `reused`, `output_tokens`; tok/J = server decode rate / `hardware.gpu_power` |
 
-Missing/null/renamed fields read as `—`. A failed scrape clears the remote
-panels, retries automatically, and backs off to at least two seconds after
-three failures. SQLite model samples include Strata rates/context/server totals;
+Missing/null/renamed fields read as `—`. Connection/read waits are bounded
+at 500/1500 ms. A failed or hung scrape retains the last successful snapshot
+with an amber **STALE** badge and its age. Stale samples do not extend rate or
+acceptance histories. The same poller recovers automatically, with a two-second
+backoff after three failures. Before the first successful scrape it shows
+metrics unavailable. SQLite model samples include Strata rates/context/server totals;
 Strata's historical requests are displayed but not imported into the SQLite
 request table, so polling does not fabricate TTFT or duplicate old requests.
 The SQLite GPU table continues to describe the dashboard host, not the remote
 server. Use `--log-db off` for a console-only session.
 
-Live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
+Fork integration and deployment: [hajek.3 report](docs/strata-flash-release.md).
+Earlier live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
 Parser fixtures and provenance are described in [fixtures/README.md](fixtures/README.md).
 
 ## Command-line options
@@ -726,9 +744,9 @@ selected by PID/endpoint. Unknown placement never borrows every vendor's
 activity; visibility masks alone do not establish use on a mixed host (including
 Intel masks). Pure NVIDIA and Intel hosts retain their affinity-mask fallback.
 `llm-visuals --version` and `-V` print the Cargo package version.
-Strata servers are recognized from their process and `--ple-gguf` model source;
-only process/GPU telemetry is shown for them. No HTTP counter adapter is
-implemented for Strata, so the dashboard does not send it llama.cpp probes.
+Strata servers are recognized from their HTTP launcher and native child.
+Rates, context and recent requests come from Strata's JSON `/metrics`, never
+from llama.cpp probes. See [Strata](#strata) for field sources and limitations.
 
 **MTP panel says "start llama-server with --metrics".** Exactly that; see
 above.

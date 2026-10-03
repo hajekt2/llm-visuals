@@ -1,0 +1,11 @@
+{
+  "engine": {"model": "synthetic-qwen", "version": "0.1.35", "max_context": 262144, "kv": "int8", "spec": 6, "mtp_max": 4, "images": false},
+  "live": {"state": "idle", "generated": null},
+  "totals": {"since": 1000, "requests": 2, "output_tokens": 1140, "drafts_offered": 828, "drafts_accepted": 729},
+  "requests": [
+    {"finish": "stop", "prompt_tokens": 1000, "reused": 900, "output_tokens": 1040, "prompt_ms": 100, "decode_tok_s": 70, "duration_s": 15, "drafts_offered": 728, "drafts_accepted": 641},
+    {"finish": "stop", "prompt_tokens": 100, "reused": 0, "output_tokens": 100, "prompt_ms": 100, "decode_tok_s": 50, "duration_s": 2.1, "drafts_offered": 100, "drafts_accepted": 88},
+    {"finish": "stop", "prompt_tokens": 100, "reused": 0, "output_tokens": 50, "drafts_offered": null, "drafts_accepted": null},
+    {"finish": "stop", "prompt_tokens": 100, "reused": 0, "output_tokens": 0, "drafts_offered": 0, "drafts_accepted": 0}
+  ]
+}

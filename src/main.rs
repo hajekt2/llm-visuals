@@ -132,12 +132,6 @@ async fn discover(
     let mut explicit_models = Vec::new();
     let mut explicit_error = None;
     let explicit_ep = args.endpoint_url();
-    if args.backend == "strata" && explicit_ep.is_none() {
-        return (
-            Vec::new(),
-            Some("--backend strata needs --endpoint or --model http://...".into()),
-        );
-    }
 
     // 1. Explicit endpoint URL (--endpoint, --model http://..., or LLM_ENDPOINT)
     if let Some(ref ep) = explicit_ep {
@@ -165,10 +159,21 @@ async fn discover(
     // 2. Scan processes for running LLM servers
     let mut proc_models = model_detect::detect_models(inventory);
 
+    if args.backend == "strata" {
+        proc_models.retain(|m| m.engine == "strata");
+    }
+
     // 3. If no models found by process scan and no explicit endpoint was configured,
     // probe local candidate endpoints (vLLM, llama.cpp, etc.)
     if proc_models.is_empty() && explicit_ep.is_none() {
-        proc_models = model_detect::probe_local_endpoints(auth).await;
+        proc_models = if args.backend == "strata" {
+            model_detect::probe_strata("127.0.0.1", strata::DEFAULT_PORT, auth)
+                .await
+                .into_iter()
+                .collect()
+        } else {
+            model_detect::probe_local_endpoints(auth).await
+        };
     }
 
     let mappings = placement::mappings(
@@ -208,14 +213,16 @@ async fn discover(
     let mut found = explicit_models;
     for m in proc_models {
         let duplicate = found.iter_mut().find(|fm| {
-            (fm.port.is_some() && fm.port == m.port) || (!fm.name.is_empty() && fm.name == m.name)
+            (fm.host == m.host
+                || (model_detect::is_local_host(&fm.host) && model_detect::is_local_host(&m.host)))
+                && ((fm.port.is_some() && fm.port == m.port)
+                    || (fm.port.is_none()
+                        && m.port.is_none()
+                        && !fm.name.is_empty()
+                        && fm.name == m.name))
         });
         if let Some(fm) = duplicate {
-            let is_loopback = matches!(
-                fm.host.as_str(),
-                "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" | "[::1]"
-            );
-            if is_loopback {
+            if model_detect::is_local_host(&fm.host) {
                 if fm.pid == 0 {
                     fm.pid = m.pid;
                 }
@@ -263,8 +270,10 @@ async fn discover(
                 if let Some(info) =
                     model_detect::probe_strata(&model.host, port, &auth_for(model, auth)).await
                 {
-                    model.name = info.name;
-                    model.ctx_max = info.ctx_max;
+                    if info.name != format!("strata-{port}") {
+                        model.name = info.name;
+                    }
+                    model.ctx_max = info.ctx_max.or(model.ctx_max);
                 }
             }
         }
@@ -323,9 +332,6 @@ fn spawn_pollers(
         .collect();
     models
         .iter()
-        // Strata is process/GPU telemetry only until its counter API has an
-        // adapter. Never send llama.cpp probes to an unrelated engine.
-        .filter(|m| m.engine != "strata")
         .filter_map(|m| m.port.map(|port| (m.clone(), port)))
         .map(|(m, port)| {
             let live_tx = live_tx.clone();
@@ -362,17 +368,27 @@ async fn poll_server(
     if model.engine == "strata" {
         let mut adapter = strata::StrataAdapter::default();
         let mut misses = 0u32;
+        let mut last_good: Option<(Instant, LiveStats)> = None;
         loop {
+            // http_get bounds connection/read waits to 500/1500 ms. Strata
+            // can block its metrics handler while busy; retain labelled data.
             let stats = match strata::poll_metrics(&model.host, port, &auth).await {
                 Some(m) => {
                     misses = 0;
-                    adapter.observe(m)
+                    let stats = adapter.observe(m);
+                    last_good = Some((Instant::now(), stats.clone()));
+                    stats
                 }
                 None => {
                     misses = misses.saturating_add(1);
-                    // Clear stale remote metrics immediately, not a frozen busy
-                    // request. A subsequent successful scrape recovers unaided.
-                    LiveStats::default()
+                    let mut stats = last_good
+                        .as_ref()
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_default();
+                    if let (Some((at, _)), Some(m)) = (&last_good, &mut stats.strata) {
+                        m.stale_for = Some(at.elapsed());
+                    }
+                    stats
                 }
             };
             if live_tx.send((pid, stats)).await.is_err() {
@@ -381,7 +397,7 @@ async fn poll_server(
             let delay = if misses >= 3 {
                 poll.max(Duration::from_secs(2))
             } else {
-                poll.max(Duration::from_millis(200))
+                poll.max(Duration::from_millis(400))
             };
             tokio::time::sleep(delay).await;
         }
@@ -586,7 +602,7 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
     match slots.len() {
         0 => format!(
-            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang) — press r to rescan"
+            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang / Strata) — press r to rescan"
         ),
         1 => format!("{prefix}attached to {}", slots[0].model),
         n => format!(
@@ -1087,10 +1103,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     slot.ctx_max = s.ctx_max;
                 }
                 if let Some(m) = &s.strata {
-                    if let Some(name) = strata::text(&m.engine, "model") {
+                    if let Some(name) =
+                        strata::text(&m.engine, "model").filter(|name| !name.is_empty())
+                    {
                         slot.model.name = name.to_string();
                     }
-                    slot.model.ctx_max = m.context_max();
+                    if let Some(ctx) = m.context_max() {
+                        slot.model.ctx_max = Some(ctx);
+                    }
+                    // /metrics reports image support, not the encoder device.
+                    match m.engine.get("images").and_then(serde_json::Value::as_bool) {
+                        Some(false) => slot.model.vision = None,
+                        Some(true) if slot.model.vision.is_none() => {
+                            slot.model.vision = Some(vision::Vision {
+                                loaded: None,
+                                place: vision::Place::Unknown,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 slot.perf.observe(&s, now);
                 slot.live = s;
@@ -1400,22 +1431,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strata_telemetry_does_not_start_http_pollers() {
+    async fn strata_process_model_starts_metrics_poller() {
+        let (port, _shutdown) =
+            spawn_mock_server("{}", include_str!("../fixtures/strata-metrics-0.1.38.json")).await;
         let mut model = demo::demo_models(8192, 1).remove(0);
         model.engine = "strata".into();
-        model.port = Some(8098);
-        let (live, _) = mpsc::channel(1);
+        model.host = "127.0.0.1".into();
+        model.port = Some(port);
+        let key = model.key();
+        let (live, mut samples) = mpsc::channel(1);
         let (spec, _) = mpsc::channel(1);
         let (experts, _) = mpsc::channel(1);
-        assert!(spawn_pollers(
+        let handles = spawn_pollers(
             &[model],
             &live,
             &spec,
             &experts,
             Duration::from_millis(200),
-            &HttpAuth::default()
-        )
-        .is_empty());
+            &HttpAuth::default(),
+        );
+        assert_eq!(handles.len(), 1);
+        let (pid, stats) = tokio::time::timeout(Duration::from_secs(3), samples.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for handle in handles {
+            handle.abort();
+        }
+        assert_eq!(pid, key);
+        assert_eq!(stats.ctx_max, 262144);
+        assert_eq!(stats.strata.unwrap().requests.len(), 12);
     }
 
     #[test]
@@ -1590,13 +1635,10 @@ mod tests {
             assert_eq!(m.name, "Qwen3.8-Flash-Next-IQ3_S");
             assert_eq!(m.ctx_max, Some(262144));
         }
-        let args = Args::try_parse_from(["llm-visuals", "--backend", "strata"]).unwrap();
-        let (_, err) = discover(&args, &HttpAuth::default()).await;
-        assert!(err.unwrap().contains("needs --endpoint"));
     }
 
     #[tokio::test]
-    async fn strata_poller_recovers_and_clears_failed_scrapes() {
+    async fn strata_poller_retains_labelled_stale_data_and_recovers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1608,6 +1650,13 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.unwrap();
                 assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /metrics HTTP/1.1"));
+                if state.load(Ordering::SeqCst) == 3 {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        drop(stream);
+                    });
+                    continue;
+                }
                 let (status, body) = match state.load(Ordering::SeqCst) {
                     0 => ("200 OK", include_str!("../fixtures/strata-busy.json")),
                     1 => (
@@ -1652,8 +1701,29 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            if s.strata.is_none() {
-                assert!(!s.processing);
+            if s.strata.as_ref().is_some_and(|m| m.stale_for.is_some()) {
+                assert!(s.processing);
+                assert_eq!(s.ctx_used(), live.ctx_used());
+                assert_eq!(
+                    s.strata.as_ref().unwrap().requests.len(),
+                    live.strata.as_ref().unwrap().requests.len()
+                );
+                break;
+            }
+        }
+        // A hung handler also produces stale samples within the short timeout.
+        stage.store(3, Ordering::SeqCst);
+        loop {
+            let (_, s) = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if s.strata
+                .as_ref()
+                .and_then(|m| m.stale_for)
+                .is_some_and(|age| age >= Duration::from_secs(1))
+            {
+                assert!(s.processing);
                 break;
             }
         }
@@ -1664,7 +1734,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            if s.strata.is_some() {
+            if s.strata.as_ref().is_some_and(|m| m.stale_for.is_none()) {
                 assert!(!s.processing);
                 break;
             }

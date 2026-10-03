@@ -611,6 +611,38 @@ impl PerfTracker {
     /// Its recent requests are rendered from /metrics, not reconstructed from
     /// polling edges (which cannot measure TTFT or recover live prefix reuse).
     fn observe_strata(&mut self, m: &crate::strata::StrataMetrics, now: Instant) {
+        let restarted = self
+            .last_sample
+            .as_ref()
+            .and_then(|(_, s)| s.strata.as_ref())
+            .is_some_and(|prev| {
+                prev.totals.get("since") != m.totals.get("since")
+                    || prev.engine.get("model") != m.engine.get("model")
+                    || crate::strata::number(&m.totals, "requests")
+                        .zip(crate::strata::number(&prev.totals, "requests"))
+                        .is_some_and(|(a, b)| a < b)
+            });
+        if restarted {
+            self.spec = SpecStats::new();
+        }
+        if let Some((draft_tokens, accepted)) = crate::strata::draft_counts(&m.totals) {
+            if draft_tokens < self.spec.totals.draft_tokens || accepted < self.spec.totals.accepted
+            {
+                self.spec = SpecStats::new();
+            }
+            self.observe_spec(
+                &SpecMetrics {
+                    draft_tokens,
+                    accepted,
+                    // Strata has no verification-step counter. The renderer must
+                    // not invent a tokens/step number from mtp_max or output count.
+                    ..Default::default()
+                },
+                now,
+            );
+        } else {
+            self.spec = SpecStats::new();
+        }
         self.phase = match m.state() {
             "reading" => Phase::Prefill,
             "generating" => Phase::Decode,
@@ -647,12 +679,25 @@ impl PerfTracker {
     pub fn observe(&mut self, s: &LiveStats, now: Instant) {
         self.samples += 1;
         if let Some(m) = &s.strata {
+            if m.stale_for.is_some() {
+                // Keep the last rates, but do not add repeated stale samples
+                // to throughput/speculation windows or treat them as fresh.
+                self.poll_ok = false;
+                return;
+            }
             self.poll_ok = true;
             self.observe_strata(m, now);
             self.last_sample = Some((now, s.clone()));
             return;
         }
         self.poll_ok = true;
+        if self
+            .last_sample
+            .as_ref()
+            .is_some_and(|(_, prev)| prev.strata.is_some())
+        {
+            self.spec = SpecStats::new();
+        }
         let Some((t0, prev)) = self.last_sample.clone() else {
             self.last_sample = Some((now, s.clone()));
             if s.processing {

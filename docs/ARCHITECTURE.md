@@ -116,10 +116,17 @@ prefill progress deltas (which include reused tokens). Context matches Strata's
 Monitor: live prompt + generated tokens, else the last request when idle.
 Server-lifetime totals are taken from `totals`; request rows are rendered from
 `requests`, not fabricated from polling boundaries or imported into SQLite.
-Missing metrics clear the snapshot, and the same poller retries with backoff.
-The focused Strata layout renders hardware from the remote snapshot instead of
-local driver telemetry. Unsupported TTFT, speculative acceptance and parked
-occupancy are labelled unavailable. See the README's Strata field table.
+Failed or hung scrapes retain the last good snapshot with a stale age. They
+are excluded from rate/acceptance histories; the same poller retries with
+backoff. Requests use the existing 500/1500 ms connection/read timeouts.
+The remote Strata layout renders hardware from the server snapshot. Local
+processes keep the mixed-GPU driver panels and their placement provenance,
+without estimating Strata's weight/KV split. Native GGUF metadata comes from
+`--config` through the launcher's mount namespace; it supplies architecture
+counts, not per-layer placement or routing. Optional 0.1.38 draft counters
+provide completed-request and server-total acceptance. Unsupported TTFT,
+verification steps and parked occupancy stay unknown. See the README's
+Strata field table.
 
 **HuggingFace `config.json`** (safetensors dirs, including nested
 `text_config`) fills the same architecture fields as a GGUF header, so the

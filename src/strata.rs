@@ -2,6 +2,10 @@
 //! windowed by the server. Preserve unknown fields as unknown, not real zeroes.
 use crate::observe::{http_get, HttpAuth, LiveStats};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// Strata HTTP default, not llama.cpp's 8080.
+pub const DEFAULT_PORT: u16 = 8095;
 
 #[derive(Debug, Clone, Default)]
 pub struct StrataMetrics {
@@ -11,12 +15,28 @@ pub struct StrataMetrics {
     pub hardware: Value,
     pub hardware_static: Value,
     pub requests: Vec<Value>,
+    pub history: Value,
+    /// Age since the last successful scrape when polling fails. Never fresh data.
+    pub stale_for: Option<std::time::Duration>,
 }
 
 /// Numeric fields can disappear or become null between engine versions.
 /// Reject negative/non-finite values and strings rather than inventing data.
 pub fn number(v: &Value, key: &str) -> Option<f64> {
     v.get(key)?.as_f64().filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+/// 0.1.35 counts are optional (including explicit null), never estimated.
+/// A zero denominator is reported but has no defined acceptance percentage.
+pub fn draft_counts(v: &Value) -> Option<(u64, u64)> {
+    let offered = v.get("drafts_offered")?.as_u64()?;
+    let accepted = v.get("drafts_accepted")?.as_u64()?;
+    (accepted <= offered).then_some((offered, accepted))
+}
+
+pub fn draft_acceptance(v: &Value) -> Option<f32> {
+    let (offered, accepted) = draft_counts(v)?;
+    (offered > 0).then(|| accepted as f32 / offered as f32)
 }
 
 pub fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -40,11 +60,13 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
         totals: v.get("totals").cloned().unwrap_or_default(),
         hardware: v.get("hardware").cloned().unwrap_or_default(),
         hardware_static: v.get("hardware_static").cloned().unwrap_or_default(),
+        history: v.get("history").cloned().unwrap_or_default(),
         requests: v
             .get("requests")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        stale_for: None,
     })
 }
 
@@ -69,7 +91,7 @@ impl StrataMetrics {
 
     /// Monitor context, not the total residency of parked conversations.
     pub fn context_used(&self) -> Option<usize> {
-        let (source, generated_key) = if self.state() == "idle" {
+        let (source, generated_key) = if matches!(self.state(), "idle" | "unloaded") {
             (self.requests.first()?, "output_tokens")
         } else {
             (&self.live, "generated")
@@ -122,7 +144,7 @@ impl StrataAdapter {
         self.prev_requests = completed;
         // Match the Monitor's context display: the live request, else the last
         // completed one. This is not a count of all resident/parked KV tokens.
-        let source = if m.state() == "idle" {
+        let source = if matches!(m.state(), "idle" | "unloaded") {
             m.requests.first().unwrap_or(&Value::Null)
         } else {
             &m.live
@@ -134,8 +156,16 @@ impl StrataAdapter {
             // Progress includes a reused prefix; it is NOT newly computed
             // prefill. Use Strata's measured prefill rate instead of deltas.
             prompt_processed: 0,
-            decoded: if processing { generated } else { 0 },
-            decoded_present: number(&m.live, "generated").is_some(),
+            decoded: if processing {
+                generated
+            } else {
+                number(source, "output_tokens").unwrap_or(0.0) as usize
+            },
+            decoded_present: if processing {
+                number(&m.live, "generated").is_some()
+            } else {
+                number(source, "output_tokens").is_some()
+            },
             cache_tokens: if processing {
                 0
             } else {
@@ -143,6 +173,18 @@ impl StrataAdapter {
             },
             cache_unknown: processing || number(source, "reused").is_none(),
             processing,
+            n_slots: 1,
+            slots_busy: usize::from(processing),
+            spec_types: if number(&m.engine, "spec").is_some_and(|n| n > 0.0) {
+                if number(&m.engine, "mtp_max").is_some_and(|n| n > 0.0) {
+                    "mtp".into()
+                } else {
+                    "lookup".into()
+                }
+            } else {
+                "none".into()
+            },
+            spec_depth: number(&m.engine, "mtp_max").unwrap_or(0.0) as usize,
             id_task: self.task,
             kv_tokens: m.context_used(),
             strata: Some(m),
@@ -151,12 +193,150 @@ impl StrataAdapter {
     }
 }
 
+/// The native `strata --serve` child. It holds the GPU memory but speaks
+/// only to its parent over a pipe, so it is folded into the server.
+pub fn is_engine(process_name: &str, cmdline: &str) -> bool {
+    let argv0 = cmdline.split_whitespace().next().unwrap_or(process_name);
+    let base = Path::new(argv0)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    (base == "strata" || base == "strata.exe") && cmdline.split_whitespace().any(|t| t == "--serve")
+}
+
+/// What the server's `--config` JSON says about the model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StrataConfig {
+    pub model_name: Option<String>,
+    /// Native GGUF shard (`--native`), which carries the full architecture header.
+    pub gguf: Option<PathBuf>,
+    pub max_context: Option<usize>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+pub fn parse_config(body: &str) -> Option<StrataConfig> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let args: Vec<&str> = v
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let flag = |name: &str| {
+        args.iter().enumerate().find_map(|(i, a)| {
+            a.strip_prefix(&format!("{name}="))
+                .or_else(|| (*a == name).then(|| args.get(i + 1).copied()).flatten())
+                .map(str::to_string)
+        })
+    };
+    Some(StrataConfig {
+        model_name: v
+            .get("model_name")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        gguf: flag("--native")
+            .filter(|path| !path.starts_with('-') && path.ends_with(".gguf"))
+            .map(PathBuf::from),
+        max_context: flag("--max-context").and_then(|s| s.parse().ok()),
+        host: text(&v, "host").map(str::to_string),
+        port: v
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok()),
+    })
+}
+
+/// The `--config` path on a server command line, resolved against `cwd`.
+pub fn config_path(cmdline: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let p = PathBuf::from(crate::sglang::cmdline_flag(cmdline, "--config")?);
+    Some(match cwd {
+        Some(dir) if p.is_relative() => dir.join(p),
+        _ => p,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn fixture(name: &str) -> StrataMetrics {
         parse_metrics(&std::fs::read_to_string(format!("fixtures/strata-{name}.json")).unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn recorded_0_1_38_context_requests_and_live_rates() {
+        use crate::perf::{PerfTracker, Phase};
+        use std::time::{Duration, Instant};
+        let mut m = parse_metrics(include_str!("../fixtures/strata-metrics-0.1.38.json")).unwrap();
+        assert_eq!(text(&m.engine, "version"), Some("0.1.38"));
+        assert_eq!(m.context_max(), Some(262144));
+        assert_eq!(m.context_used(), Some(135543 + 191));
+        assert_eq!(m.requests.len(), 12);
+        assert_eq!(number(&m.requests[0], "prompt_read"), Some(19.0));
+        assert_eq!(number(&m.requests[0], "decode_tok_s"), Some(15.0));
+        assert_eq!(draft_counts(&m.totals), Some((42595, 31488)));
+        assert_eq!(m.decode_rate(), Some(0.0)); // idle is not a historical rate
+        let mut a = StrataAdapter::default();
+        let mut p = PerfTracker::new();
+        let now = Instant::now();
+        let idle = a.observe(m.clone());
+        assert_eq!(idle.ctx_used(), 135734);
+        assert_eq!(idle.decoded, 191);
+        assert_eq!(idle.cache_tokens, 135524);
+        assert_eq!(idle.spec_types, "mtp");
+        assert_eq!(idle.spec_depth, 4);
+        p.observe(&idle, now);
+        assert_eq!(p.session_requests, 61);
+        assert_eq!(p.session_prefilled, 123256);
+        assert_eq!(p.session_decoded, 48979);
+
+        // Exercise nullable live fields with the same recorded schema. Values
+        // below are synthetic phase transitions, not a captured live request.
+        m.live = serde_json::json!({"state":"reading", "prompt_tokens":1000,
+            "prompt_read":20, "prompt_total":1000, "generated":0,
+            "tok_s":null, "prefill_tok_s_mean":13.1});
+        p.observe(&a.observe(m.clone()), now + Duration::from_millis(400));
+        assert_eq!(p.phase, Phase::Prefill);
+        assert_eq!(p.prefill_tps, 13.1);
+        assert_eq!(p.decode_tps, 0.0);
+        m.live["state"] = "generating".into();
+        m.live["generated"] = 30.into();
+        m.live["tok_s"] = 51.7.into();
+        m.live["prefill_tok_s_mean"] = 208.4.into();
+        let busy = a.observe(m);
+        assert_eq!(busy.ctx_used(), 1030);
+        p.observe(&busy, now + Duration::from_millis(800));
+        assert_eq!(p.phase, Phase::Decode);
+        assert_eq!(p.decode_tps, 51.7);
+        assert_eq!(p.prefill_tps, 208.4);
+        let samples = p.decode_hist.len();
+        let mut stale = busy.clone();
+        stale.strata.as_mut().unwrap().stale_for = Some(Duration::from_secs(2));
+        p.observe(&stale, now + Duration::from_secs(3));
+        assert!(!p.poll_ok);
+        assert_eq!(p.decode_hist.len(), samples);
+        assert_eq!(p.decode_tps, 51.7);
+        assert_eq!(p.session_requests, 61);
+        p.observe(&busy, now + Duration::from_secs(4));
+        assert!(p.poll_ok);
+    }
+
+    #[test]
+    fn recorded_unloaded_engine_keeps_last_request_context_without_claiming_residency() {
+        let m = parse_metrics(include_str!(
+            "../fixtures/strata-metrics-0.1.38-unloaded.json"
+        ))
+        .unwrap();
+        assert_eq!(m.state(), "unloaded");
+        assert_eq!(m.context_used(), Some(135753));
+        assert_eq!(m.decode_rate(), Some(0.0));
+        assert_eq!(text(&m.requests[0], "finish"), Some("error"));
+        assert!(draft_acceptance(&m.requests[0]).is_none());
+        let s = StrataAdapter::default().observe(m);
+        assert!(!s.processing);
+        assert_eq!(s.ctx_used(), 135753);
+        assert!(s.cache_unknown);
+        assert_eq!(s.decoded, 0);
     }
 
     #[test]
@@ -250,6 +430,104 @@ mod tests {
         ] {
             assert!(parse_metrics(body).is_none(), "{body}");
         }
+    }
+
+    #[test]
+    fn acceptance_optional_and_windowed_across_restarts() {
+        use crate::perf::PerfTracker;
+        use std::time::{Duration, Instant};
+        let modern = parse_metrics(include_str!("../fixtures/strata-metrics-0.1.35.json")).unwrap();
+        assert!((draft_acceptance(&modern.requests[0]).unwrap() - 641.0 / 728.0).abs() < 1e-6);
+        assert!(draft_acceptance(&modern.requests[2]).is_none());
+        assert_eq!(draft_counts(&modern.requests[3]), Some((0, 0)));
+        assert!(draft_acceptance(&modern.requests[3]).is_none());
+        for v in [
+            serde_json::json!({"drafts_offered": 1, "drafts_accepted": 2}),
+            serde_json::json!({"drafts_offered": null, "drafts_accepted": 0}),
+            serde_json::json!({"drafts_offered": -1, "drafts_accepted": 0}),
+        ] {
+            assert!(draft_counts(&v).is_none());
+        }
+        let mut baseline = modern.clone();
+        baseline.totals = serde_json::json!({"since":1000,"requests":1,"output_tokens":100,"drafts_offered":100,"drafts_accepted":88});
+        let mut a = StrataAdapter::default();
+        let mut p = PerfTracker::new();
+        let now = Instant::now();
+        p.observe(&a.observe(baseline), now);
+        assert!(p.spec.available);
+        assert_eq!(p.spec.drafts_per_sec, 0.0); // initial sums aren't window deltas
+        p.observe(&a.observe(modern.clone()), now + Duration::from_millis(400));
+        assert!((p.spec.accept_rate - 641.0 / 728.0).abs() < 1e-6);
+        assert_eq!(p.spec.totals.accepted, 729);
+        assert_eq!(p.spec.totals.verify_steps, 0); // not inferable
+        p.observe(&a.observe(modern.clone()), now + Duration::from_secs(3));
+        assert_eq!(p.spec.drafts_per_sec, 0.0); // quiet window expires
+
+        let mut reset = modern.clone();
+        reset.totals["drafts_offered"] = 0.into();
+        reset.totals["drafts_accepted"] = 0.into();
+        p.observe(&a.observe(reset.clone()), now + Duration::from_secs(4));
+        assert_eq!(p.spec.accept_rate, 0.0);
+        assert!(p.spec.accept_hist.is_empty());
+        reset.totals["drafts_offered"] = 10.into();
+        reset.totals["drafts_accepted"] = 5.into();
+        p.observe(&a.observe(reset), now + Duration::from_millis(4400));
+        assert_eq!(p.spec.accept_rate, 0.5);
+        // A changed server start time resets even if sums increased across
+        // the restart (counter decrease alone doesn't detect that case).
+        let mut restarted = modern.clone();
+        restarted.totals["since"] = 2000.into();
+        p.observe(&a.observe(restarted), now + Duration::from_secs(5));
+        assert_eq!(p.spec.drafts_per_sec, 0.0);
+        assert!(p.spec.accept_hist.is_empty());
+        let mut null = modern;
+        null.totals["drafts_offered"] = Value::Null;
+        p.observe(&a.observe(null), now + Duration::from_secs(6));
+        assert!(!p.spec.available);
+        p.observe(&a.observe(fixture("idle")), now + Duration::from_secs(7));
+        assert!(!p.spec.available); // 0.1.31 has no fields
+    }
+
+    #[test]
+    fn upstream_older_shape_keeps_acceptance_unknown() {
+        let m = parse_metrics(include_str!("../fixtures/strata-metrics-upstream.json")).unwrap();
+        assert_eq!(m.context_max(), Some(32768));
+        assert_eq!(m.context_used(), Some(95 + 16371));
+        assert_eq!(m.decode_rate(), Some(43.9));
+        assert!(m.prefill_rate().is_none());
+        assert!(draft_counts(&m.totals).is_none());
+        assert!(draft_acceptance(&m.requests[0]).is_none());
+    }
+
+    #[test]
+    fn native_engine_and_config_facts() {
+        assert!(is_engine(
+            "strata",
+            "/opt/strata --serve --native /models/a.gguf"
+        ));
+        assert!(!is_engine("strata", "/opt/strata --bench"));
+        assert!(!is_engine(
+            "python",
+            "python serve/server.py --engine strata"
+        ));
+        let cfg = parse_config(
+            r#"{"model_name":"qwen","host":"172.16.0.73","port":8098,"args":["--native=/models/a.gguf","--max-context","32768"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.gguf, Some(PathBuf::from("/models/a.gguf")));
+        assert_eq!(cfg.max_context, Some(32768));
+        assert_eq!(cfg.host.as_deref(), Some("172.16.0.73"));
+        assert_eq!(cfg.port, Some(8098));
+        assert_eq!(cfg.model_name.as_deref(), Some("qwen"));
+        let old = parse_config(r#"{"args":["--native","--ple-gguf","/models/ple.gguf"]}"#).unwrap();
+        assert!(old.gguf.is_none()); // old --native was a boolean, not a path
+        assert_eq!(
+            config_path(
+                "python serve/server.py --config=a.json",
+                Some(Path::new("/srv"))
+            ),
+            Some(PathBuf::from("/srv/a.json"))
+        );
     }
 
     #[tokio::test]
