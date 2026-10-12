@@ -536,6 +536,11 @@ llm-visuals --endpoint http://inference-host:8098 --backend strata --log-db off
 scan, including their `--host`, `--port` and `--config`. The HTTP launcher's
 default port is 8095; inference03 explicitly uses 8098. Its native child is
 folded into the launcher for GPU attribution, not polled as another server.
+Project Maya launchers pass no `--host`; when the mount namespace denies an
+ordinary user, the `--config` path is re-anchored through mountinfo so the
+config's bind address, port and model name still apply. Maya's
+`strata-vision` encoder child folds into the launcher as a vision mark instead
+of listing itself as a model.
 A remote server must be selected by URL; the dashboard does not scan your network.
 
 The Strata view shows server-windowed decode and engine-measured mean prefill
@@ -552,6 +557,8 @@ Recent requests come directly from Strata, newest first, with measured prompt
 and decode rates/times and finish reasons.
 
 Verified against Strata **0.1.38**, with older 0.1.31 fixtures retained.
+Project Maya 1.1.1 keeps the same `/metrics` contract; its GLM-5.3-Flash
+launcher is verified live on inference03 (see the [hajek.4 report](strata-maya-release.md)).
 Draft acceptance uses optional `drafts_accepted / drafts_offered` counters
 from completed requests and server totals. These are not live verification
 steps. Older versions without these fields show acceptance as unavailable.
@@ -593,7 +600,8 @@ request table, so polling does not fabricate TTFT or duplicate old requests.
 The SQLite GPU table continues to describe the dashboard host, not the remote
 server. Use `--log-db off` for a console-only session.
 
-Fork integration and deployment: [hajek.3 report](docs/strata-flash-release.md).
+Fork integration and deployment: [hajek.4 report](docs/strata-maya-release.md)
+and the earlier [hajek.3 report](docs/strata-flash-release.md).
 Earlier live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
 Parser fixtures and provenance are described in [fixtures/README.md](fixtures/README.md).
 

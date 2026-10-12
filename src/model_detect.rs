@@ -233,6 +233,8 @@ fn detect_vision(m: &DetectedModel) -> Option<Vision> {
                 place: vision::llama_place(&args, m.pid, &env, &m.gpu_indices),
             })
         }
+        // The fold marks a folded strata-vision child on the server row.
+        "strata" => m.vision.clone(),
         "vllm" | "sglang" => {
             let dir = m.path.as_ref().filter(|p| p.is_dir())?;
             let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
@@ -842,10 +844,17 @@ fn apply_strata_config(m: &mut DetectedModel) {
     let Some(path) = crate::strata::config_path(&m.cmdline, None) else {
         return;
     };
-    let Some(cfg) = std::fs::read_to_string(process_file(m.pid, &path))
+    // The launcher's mount namespace answers for a readable container, but
+    // a root-owned Docker launcher denies ordinary users. Re-anchor through
+    // mountinfo instead: the published host-side copy is the same file and
+    // still carries the bind address (Maya issue #26: the run scripts pass
+    // no --host, the config can).
+    let body = std::fs::read_to_string(process_file(m.pid, &path))
         .ok()
-        .and_then(|body| crate::strata::parse_config(&body))
-    else {
+        .or_else(|| {
+            resolve_container_path(m.pid, &path).and_then(|p| std::fs::read_to_string(p).ok())
+        });
+    let Some(cfg) = body.and_then(|body| crate::strata::parse_config(&body)) else {
         return;
     };
     if let Some(name) = cfg.model_name {
@@ -1449,7 +1458,11 @@ fn fold_strata_workers(
 ) {
     let workers: Vec<_> = models
         .values()
-        .filter(|m| m.engine == "strata" && crate::strata::is_engine(&m.process_name, &m.cmdline))
+        .filter(|m| {
+            m.engine == "strata"
+                && (crate::strata::is_engine(&m.process_name, &m.cmdline)
+                    || is_strata_vision(&m.process_name, &m.cmdline))
+        })
         .filter_map(|m| {
             server_ancestor(
                 m.pid,
@@ -1467,16 +1480,42 @@ fn fold_strata_workers(
             continue;
         };
         server.mem_used_mb = server.mem_used_mb.saturating_add(worker.mem_used_mb);
-        for gpu in worker.gpu_indices {
-            if !server.gpu_indices.contains(&gpu) {
-                server.gpu_indices.push(gpu);
+        let renames_server = crate::strata::is_engine(&worker.process_name, &worker.cmdline);
+        let worker_gpus = worker.gpu_indices.clone();
+        for gpu in &worker_gpus {
+            if !server.gpu_indices.contains(gpu) {
+                server.gpu_indices.push(*gpu);
             }
         }
-        if worker.path.is_some() {
+        // The native engine child names the served model; the strata-vision
+        // child names only its own encoder shard.
+        if worker.path.is_some() && renames_server {
             server.path = worker.path;
             server.name = worker.name;
         }
+        if is_strata_vision(&worker.process_name, &worker.cmdline) {
+            let place = if worker_gpus.is_empty() {
+                Place::Cpu
+            } else {
+                Place::Gpus(worker_gpus.clone())
+            };
+            server.vision = Some(Vision {
+                loaded: Some(true),
+                place,
+            });
+        }
     }
+}
+
+/// Maya's `strata-vision` encoder is a second native child of the launcher.
+/// It holds no endpoint, so the launcher owns it; folding must not rename
+/// the server (--model names an encoder shard, not the served LLM).
+fn is_strata_vision(process_name: &str, cmdline: &str) -> bool {
+    let argv0 = cmdline.split_whitespace().next().unwrap_or(process_name);
+    Path::new(argv0)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| f.to_lowercase() == "strata-vision")
 }
 
 fn add_gpu_app(model: &mut DetectedModel, app: &ComputeApp) {
@@ -2794,6 +2833,45 @@ mod tests {
         assert_eq!(models[&100].name, "Flash-Next");
         assert_eq!(models[&100].gpu_indices, vec![0]);
         assert_eq!(models[&100].mem_used_mb, 23_412);
+    }
+
+    #[test]
+    fn strata_vision_child_folds_without_renaming_the_server() {
+        assert!(is_strata_vision(
+            "strata-visio",
+            "/app/build-vision/bin/strata-vision --mmproj /models/mmproj.gguf"
+        ));
+        assert!(!is_strata_vision(
+            "python",
+            "python serve/server.py --engine strata --config /app/maya.json"
+        ));
+        assert!(!is_strata_vision("", ""));
+        let mut server = crate::demo::demo_models(8192, 1).remove(0);
+        server.pid = 100;
+        server.engine = "strata".into();
+        server.process_name = "python".into();
+        server.name = "glm-5.3-flash".into();
+        server.vision = None;
+        server.path = None;
+        server.gpu_indices.clear();
+        server.mem_used_mb = 0;
+        let mut worker = server.clone();
+        worker.pid = 200;
+        worker.process_name = "strata-vision".into();
+        worker.cmdline = "/app/build-vision/bin/strata-vision --mmproj /models/mmproj.gguf --model /models/GLM-5.3-Flash-vocab.gguf".into();
+        worker.name = "GLM-5.3-Flash-vocab".into();
+        worker.path = Some("/models/GLM-5.3-Flash-vocab.gguf".into());
+        worker.gpu_indices.clear();
+        worker.mem_used_mb = 1_400;
+        let mut models = std::collections::HashMap::from([(100, server), (200, worker)]);
+        fold_strata_workers(&mut models, |pid| (pid == 200).then_some(100));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[&100].name, "glm-5.3-flash");
+        assert_eq!(models[&100].path, None);
+        assert_eq!(models[&100].mem_used_mb, 1_400);
+        let vision = models[&100].vision.as_ref().expect("vision marked");
+        assert_eq!(vision.loaded, Some(true));
+        assert!(matches!(vision.place, Place::Cpu));
     }
 
     #[test]
