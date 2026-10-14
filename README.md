@@ -557,7 +557,9 @@ Recent requests come directly from Strata, newest first, with measured prompt
 and decode rates/times and finish reasons.
 
 Verified against Strata **0.1.38**, with older 0.1.31 fixtures retained.
-Project Maya 1.1.1 keeps the same `/metrics` contract; its GLM-5.3-Flash
+The poller requests JSON explicitly because newer Strata versions negotiate
+Prometheus text for broad `Accept` headers. Project Maya 1.1.1 keeps the same
+`/metrics` contract; its GLM-5.3-Flash
 launcher is verified live on inference03 (see the [hajek.4 report](strata-maya-release.md)).
 Draft acceptance uses optional `drafts_accepted / drafts_offered` counters
 from completed requests and server totals. These are not live verification
@@ -600,8 +602,9 @@ request table, so polling does not fabricate TTFT or duplicate old requests.
 The SQLite GPU table continues to describe the dashboard host, not the remote
 server. Use `--log-db off` for a console-only session.
 
-Fork integration and deployment: [hajek.4 report](docs/strata-maya-release.md)
-and the earlier [hajek.3 report](docs/strata-flash-release.md).
+Fork integration and deployment: [hajek.5 JSON metrics fix](docs/strata-json-accept-release.md),
+[hajek.4 Maya integration](docs/strata-maya-release.md) and the earlier
+[hajek.3 Strata integration](docs/strata-flash-release.md).
 Earlier live text captures: [idle](docs/strata-idle.txt), [generating](docs/strata-busy.txt).
 Parser fixtures and provenance are described in [fixtures/README.md](fixtures/README.md).
 

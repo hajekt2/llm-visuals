@@ -1,6 +1,6 @@
 //! Strata's JSON `/metrics` adapter. Unlike llama.cpp, its rate is already
 //! windowed by the server. Preserve unknown fields as unknown, not real zeroes.
-use crate::observe::{http_get, HttpAuth, LiveStats};
+use crate::observe::{http_get_with_accept, HttpAuth, LiveStats};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -71,7 +71,11 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
 }
 
 pub async fn poll_metrics(host: &str, port: u16, auth: &HttpAuth) -> Option<StrataMetrics> {
-    parse_metrics(&http_get(host, port, "/metrics", auth).await.ok()?)
+    parse_metrics(
+        &http_get_with_accept(host, port, "/metrics", auth, "application/json")
+            .await
+            .ok()?,
+    )
 }
 
 impl StrataMetrics {
@@ -528,6 +532,43 @@ mod tests {
             ),
             Some(PathBuf::from("/srv/a.json"))
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_poll_requests_json_representation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains("Accept: application/json\r\n"));
+            assert!(!request.contains("text/plain"));
+
+            let body = include_str!("../fixtures/strata-idle.json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let metrics = poll_metrics("127.0.0.1", port, &HttpAuth::default())
+            .await
+            .expect("JSON metrics response");
+        assert!(metrics.context_max().is_some());
+        server.await.unwrap();
     }
 
     #[tokio::test]

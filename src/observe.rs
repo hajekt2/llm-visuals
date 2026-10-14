@@ -57,14 +57,25 @@ impl HttpAuth {
     }
 }
 
+#[cfg(test)]
 fn http_request(host: &str, port: u16, path: &str, auth: &HttpAuth) -> String {
+    http_request_with_accept(host, port, path, auth, "application/json, text/plain, */*")
+}
+
+fn http_request_with_accept(
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: &HttpAuth,
+    accept: &str,
+) -> String {
     let authority = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
     };
     format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: application/json, text/plain, */*\r\n{}\r\n",
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: {accept}\r\n{}\r\n",
         auth.authorization_header()
     )
 }
@@ -466,12 +477,22 @@ pub async fn http_get(
     path: &str,
     auth: &HttpAuth,
 ) -> Result<String, HttpError> {
+    http_get_with_accept(host, port, path, auth, "application/json, text/plain, */*").await
+}
+
+pub(crate) async fn http_get_with_accept(
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: &HttpAuth,
+    accept: &str,
+) -> Result<String, HttpError> {
     let connect = TcpStream::connect((host, port));
     let mut stream = tokio::time::timeout(Duration::from_millis(500), connect)
         .await
         .map_err(|_| HttpError::ConnectTimeout)?
         .map_err(HttpError::Connect)?;
-    let req = http_request(host, port, path, auth);
+    let req = http_request_with_accept(host, port, path, auth, accept);
     stream
         .write_all(req.as_bytes())
         .await
@@ -498,6 +519,7 @@ mod tests {
     fn authenticated_request_uses_bearer_header() {
         let auth = HttpAuth(Some(Arc::from("test-secret")));
         let request = http_request("127.0.0.1", 11434, "/metrics", &auth);
+        assert!(request.contains("Accept: application/json, text/plain, */*\r\n"));
         assert!(request.contains("Authorization: Bearer test-secret\r\n"));
         assert!(request.ends_with("\r\n\r\n"));
 
