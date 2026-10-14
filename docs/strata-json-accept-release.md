@@ -33,5 +33,6 @@ LAN binding remains unchanged.
   server totals and request history. No inference request was sent.
 - `cargo fmt --check`, `cargo test --locked`, `cargo clippy --all-targets
   --locked -- -D warnings` and `cargo build --release --locked` passed.
-- The source version is `0.10.0-hajek.5`. Public release and installation on
-  inference03 are pending approval.
+- The public prerelease `v0.10.0-hajek.5` is published and installed on
+  inference03. A private tmux dashboard session showed the Strata model and
+  both GPUs; the session was closed without sending an inference request.
