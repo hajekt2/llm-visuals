@@ -471,7 +471,7 @@ fn process_cwd(pid: u32) -> Option<PathBuf> {
 /// runs in our netns and carries `-container-ip` / `-host-port` in its
 /// argv -- whose container IP appears in the server's namespace, and use
 /// its host port. Without CAP_SYS_PTRACE the other namespace's tables are
-/// unreadable; fall back to the command-line port in that case.
+/// unreadable; then match a docker-proxy by its container port instead.
 fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
     resolve_container_host_port(pid, cmdline_port, 8000)
 }
@@ -494,53 +494,165 @@ fn resolve_container_endpoint(
     cmdline_port: Option<u16>,
     default_port: u16,
 ) -> Option<(Option<String>, u16)> {
+    let port = cmdline_port.unwrap_or(default_port);
     let own = match std::fs::read_link("/proc/self/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(_) => return cmdline_port.map(|port| (None, port)),
     };
     let server = match std::fs::read_link(format!("/proc/{pid}/ns/net")) {
         Ok(p) => p.to_string_lossy().into_owned(),
-        // Same namespace as us (or unreadable): the command-line port is
-        // already a host port.
-        Err(_) => return cmdline_port.map(|port| (None, port)),
+        // Not readable, which is the usual case for a container whose process is
+        // owned by root: an ordinary user cannot read another user's namespace
+        // link. Do not assume the namespace is shared, because the command-line
+        // port of such a server is the container-internal one.
+        Err(_) => match published_endpoint(port) {
+            Some(endpoint) => return Some(endpoint),
+            None => return cmdline_port.map(|port| (None, port)),
+        },
     };
     if server == own {
-        return Some((None, cmdline_port.unwrap_or(default_port)));
+        return Some((None, port));
     }
-    let ips = netns_ipv4s(pid)?;
-    if ips.is_empty() {
-        return cmdline_port.map(|port| (None, port));
+    let proxies = docker_proxy_args();
+    if let Some(ips) = netns_ipv4s(pid) {
+        if !ips.is_empty() {
+            if let Some(endpoint) = proxy_endpoint_by_ip(&proxies, &ips, port) {
+                return Some(endpoint);
+            }
+        }
     }
-    let dir = std::fs::read_dir("/proc").ok()?;
+    // The server is elsewhere but no proxy named its address (a different network
+    // driver, or a proxy we cannot read): still use the port published for it.
+    published_endpoint(port).or(Some((None, port)))
+}
+
+/// The host endpoint Docker publishes for a container-internal server port, or
+/// None when that port already answers where we are (then the command line was
+/// right, and another container's identical port must not override it).
+fn published_endpoint(server_port: u16) -> Option<(Option<String>, u16)> {
+    if local_listen_ports().contains(&server_port) {
+        return None;
+    }
+    pick_published_endpoint(&docker_proxy_args(), server_port)
+}
+
+/// Command lines of the docker-proxy processes in our namespace.
+fn docker_proxy_args() -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for ent in dir.flatten() {
-        let proxy_pid: u32 = match ent.file_name().to_string_lossy().parse() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let Ok(proxy_pid) = ent.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
         };
-        let comm = match std::fs::read_to_string(format!("/proc/{proxy_pid}/comm")) {
-            Ok(c) => c.trim().to_string(),
-            Err(_) => continue,
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{proxy_pid}/comm")) else {
+            continue;
         };
-        if comm != "docker-proxy" {
+        if comm.trim() != "docker-proxy" {
             continue;
         }
-        let args: Vec<String> = match std::fs::read(format!("/proc/{proxy_pid}/cmdline")) {
-            Ok(raw) if !raw.is_empty() => raw
-                .split(|b| *b == 0)
-                .filter(|p| !p.is_empty())
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect(),
+        match std::fs::read(format!("/proc/{proxy_pid}/cmdline")) {
+            Ok(raw) if !raw.is_empty() => out.push(
+                raw.split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect(),
+            ),
             _ => continue,
-        };
-        if let Some(endpoint) = proxy_endpoint(&args, &ips, cmdline_port.unwrap_or(default_port)) {
-            return Some(endpoint);
         }
     }
-    cmdline_port.map(|port| (None, port))
+    out
+}
+
+/// One flag's value in a docker-proxy command line, e.g. `-host-port 8098`.
+fn proxy_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+}
+
+/// Docker starts one proxy per published address, so the same container port
+/// appears several times with different host addresses. Prefer loopback, which
+/// always answers, over an address bound to one interface.
+fn pick_published_endpoint(
+    proxies: &[Vec<String>],
+    server_port: u16,
+) -> Option<(Option<String>, u16)> {
+    let mut found: Vec<(String, u16)> = Vec::new();
+    for args in proxies {
+        if !matches!(proxy_flag(args, "-proto"), Some("tcp") | None) {
+            continue;
+        }
+        if proxy_flag(args, "-container-port").and_then(|v| v.parse::<u16>().ok())
+            != Some(server_port)
+        {
+            continue;
+        }
+        let (Some(host_ip), Some(host_port)) =
+            (proxy_flag(args, "-host-ip"), proxy_flag(args, "-host-port"))
+        else {
+            continue;
+        };
+        let Ok(host_port) = host_port.parse::<u16>() else {
+            continue;
+        };
+        let host = connect_host(host_ip);
+        if !found.iter().any(|(h, p)| *h == host && *p == host_port) {
+            found.push((host, host_port));
+        }
+    }
+    let index = found
+        .iter()
+        .position(|(h, _)| is_local_host(h))
+        .unwrap_or(0);
+    let (host, host_port) = found.into_iter().nth(index)?;
+    Some((Some(host), host_port))
+}
+
+/// Ports in LISTEN state in our own network namespace.
+fn local_listen_ports() -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            ports.extend(parse_listen_ports(&text));
+        }
+    }
+    ports
+}
+
+/// One row per LISTEN (`st` == 0A) entry of a /proc/net/tcp dump: the local
+/// address is the second field and its port follows the colon, in hex.
+fn parse_listen_ports(text: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 || fields[3] != "0A" {
+            continue;
+        }
+        let hex = match fields[1].rsplit(':').next() {
+            Some(hex) => hex,
+            None => continue,
+        };
+        if let Ok(port) = u16::from_str_radix(hex, 16) {
+            ports.push(port);
+        }
+    }
+    ports
 }
 
 /// A container can publish several ports and bind only one LAN address.
 /// Match its IP and internal server port before using the host endpoint.
+fn proxy_endpoint_by_ip(
+    proxies: &[Vec<String>],
+    ips: &[String],
+    server_port: u16,
+) -> Option<(Option<String>, u16)> {
+    proxies
+        .iter()
+        .find_map(|args| proxy_endpoint(args, ips, server_port))
+}
+
 fn proxy_endpoint(
     args: &[String],
     ips: &[String],
@@ -2449,6 +2561,59 @@ mod tests {
             proxy_endpoint(&wildcard, &["172.18.0.2".into()], 8095),
             Some((Some("127.0.0.1".into()), 8098))
         );
+    }
+
+    fn proxy(host_ip: &str, args: &[&str]) -> Vec<String> {
+        let mut out = vec![
+            "/usr/bin/docker-proxy".to_string(),
+            "-proto".into(),
+            "tcp".into(),
+            "-host-ip".into(),
+            host_ip.into(),
+            "-host-port".into(),
+            "8098".into(),
+            "-container-ip".into(),
+            "172.18.0.2".into(),
+            "-container-port".into(),
+            "8080".into(),
+        ];
+        out.extend(args.iter().map(|a| a.to_string()));
+        out
+    }
+
+    #[test]
+    fn published_port_without_the_namespace_needs_only_the_container_port() {
+        // The usual container case on a host we cannot ptrace: the two proxies differ
+        // only in the address they publish, so prefer the one that always answers.
+        let loopback = proxy("127.0.0.1", &[]);
+        let lan = proxy("172.16.0.73", &[]);
+        assert_eq!(
+            pick_published_endpoint(&[lan.clone(), loopback.clone()], 8080),
+            Some((Some("127.0.0.1".into()), 8098))
+        );
+        assert_eq!(
+            pick_published_endpoint(&[lan], 8080),
+            Some((Some("172.16.0.73".into()), 8098))
+        );
+        // Another engine's internal port, or a UDP publish, is not this server.
+        assert!(pick_published_endpoint(std::slice::from_ref(&loopback), 8081).is_none());
+        let mut udp = loopback.clone();
+        udp[3] = "udp".into();
+        assert!(pick_published_endpoint(&[udp], 8080).is_none());
+    }
+
+    #[test]
+    fn published_port_collapses_duplicate_publishes_and_reads_listen_rows() {
+        let both = vec![proxy("0.0.0.0", &[]), proxy("127.0.0.1", &[])];
+        assert_eq!(
+            pick_published_endpoint(&both, 8080),
+            Some((Some("127.0.0.1".into()), 8098))
+        );
+        let dump = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                     0: 0100007F:1F92 00000000:0000:0 0A 0000000000000000:0000000000000000 00:00000000 00000000 0 0 123 1 0\n\
+                     1: 00000000:1F91 0100007F:9C4A 01 0000000000000000:0000000000000000 00:00000000 00000000 0 0 456 2 3\n";
+        // 0x1F92 listens; 0x1F91 is an established client connection.
+        assert_eq!(parse_listen_ports(dump), vec![8082]);
     }
 
     #[test]
